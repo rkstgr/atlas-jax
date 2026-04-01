@@ -104,6 +104,9 @@ def main():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--gpu-peak-tflops', type=float, default=989.4,
                         help='GPU peak bf16 TFLOPS for MFU calc (H100=989.4)')
+    parser.add_argument('--matmul-precision', type=str, default='float32',
+                        choices=['float32', 'high', 'default'],
+                        help='JAX matmul precision (float32=safe, high=TF32)')
 
     # Data & I/O
     parser.add_argument('--data-dir', type=str, required=True)
@@ -112,9 +115,8 @@ def main():
 
     args = parser.parse_args()
 
-    # Set matmul precision — f32 accumulation is safe and uses bf16 tensor cores
-    # when inputs are bf16
-    jax.config.update("jax_default_matmul_precision", "float32")
+    jax.config.update("jax_default_matmul_precision", args.matmul_precision)
+    print(f"Matmul precision: {args.matmul_precision}")
 
     print(f"JAX {jax.__version__} | devices: {jax.devices()}")
     key = jax.random.PRNGKey(args.seed)

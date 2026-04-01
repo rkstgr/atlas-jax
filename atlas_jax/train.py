@@ -254,7 +254,7 @@ def main():
     print("-" * 80)
     print("Final evaluation...")
     val_losses = []
-    for _ in range(50):
+    for _ in range(args.eval_steps):
         val_inputs, val_targets = next(val_loader)
         val_loss = eval_step(model, val_inputs, val_targets)
         val_losses.append(float(val_loss))

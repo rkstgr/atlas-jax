@@ -260,7 +260,9 @@ class AtlasMemoryLayer(eqx.Module):
         if self.ns_steps > 0:
             chunk_S_orth = _pe(chunk_S, self.ns_steps)
         else:
-            chunk_S_orth = chunk_S
+            # Frobenius norm clipping as cheap substitute for PE
+            frob = jnp.sqrt(jnp.sum(chunk_S * chunk_S, axis=(-2, -1), keepdims=True) + 1e-12)
+            chunk_S_orth = chunk_S / jnp.maximum(frob, 1.0)
 
         # Memory scan: M_t = alpha_t * M_{t-1} + PE(S_t)
         alpha = jnp.squeeze(a_c, axis=-1)          # (B, cs, H)
@@ -308,13 +310,21 @@ class AtlasMemoryLayer(eqx.Module):
         # W1: momentum -> PE -> memory scan
         mom_W1 = -(e_c[..., jnp.newaxis] * u_W1)
         chunk_S_W1, S_W1 = linear_scan(S_W1, theta, mom_W1)
-        chunk_S_W1_orth = _pe(chunk_S_W1, self.ns_steps) if self.ns_steps > 0 else chunk_S_W1
+        if self.ns_steps > 0:
+            chunk_S_W1_orth = _pe(chunk_S_W1, self.ns_steps)
+        else:
+            frob = jnp.sqrt(jnp.sum(chunk_S_W1 * chunk_S_W1, axis=(-2, -1), keepdims=True) + 1e-12)
+            chunk_S_W1_orth = chunk_S_W1 / jnp.maximum(frob, 1.0)
         W1_all, W1 = linear_scan(W1, alpha, chunk_S_W1_orth)
 
         # W2: momentum -> PE -> memory scan
         mom_W2 = -(e_c[..., jnp.newaxis] * u_W2)
         chunk_S_W2, S_W2 = linear_scan(S_W2, theta, mom_W2)
-        chunk_S_W2_orth = _pe(chunk_S_W2, self.ns_steps) if self.ns_steps > 0 else chunk_S_W2
+        if self.ns_steps > 0:
+            chunk_S_W2_orth = _pe(chunk_S_W2, self.ns_steps)
+        else:
+            frob = jnp.sqrt(jnp.sum(chunk_S_W2 * chunk_S_W2, axis=(-2, -1), keepdims=True) + 1e-12)
+            chunk_S_W2_orth = chunk_S_W2 / jnp.maximum(frob, 1.0)
         W2_all, W2 = linear_scan(W2, alpha, chunk_S_W2_orth)
 
         # Output: y_t = q_t + W1_t @ GELU(W2_t @ q_t)

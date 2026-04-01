@@ -141,6 +141,13 @@ def main():
     flops_per_token = estimate_flops_per_token(config, n_params, n_embed_params)
     print(f"Parameters: {n_params:,} | FLOPs/token: {flops_per_token:,.0f}")
 
+    # Cast model to bf16 for tensor core utilization
+    # PE already upcasts to f32 internally; logits cast to f32 in model.__call__
+    def _to_bf16(x):
+        return x.astype(jnp.bfloat16) if eqx.is_array(x) and x.dtype == jnp.float32 else x
+    model = jax.tree.map(_to_bf16, model, is_leaf=eqx.is_array)
+    print(f"Model cast to bf16")
+
     # BPB conversion
     CHARS_PER_TOKEN = 3.3
     BPB_FACTOR = 1.0 / (math.log(2) * CHARS_PER_TOKEN)

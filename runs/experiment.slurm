@@ -47,7 +47,7 @@ srun python -m atlas_jax.train \
     --ns-steps=3 \
     --pe-ste \
     --seq-len=2048 \
-    --batch-size=8 \
+    --batch-size=32 \
     --lr=3e-3 \
     --weight-decay=0.1 \
     --warmup-steps=200 \

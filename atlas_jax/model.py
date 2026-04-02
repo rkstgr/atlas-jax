@@ -22,6 +22,7 @@ import equinox as eqx
 from atlas_jax.config import AtlasConfig
 from atlas_jax.polar_express import polar_express, polar_express_ste
 from atlas_jax.state import LinearMemoryState, DeepMemoryState
+from atlas_jax.scan_kernel import fused_linear_scan
 
 
 # ---------------------------------------------------------------------------
@@ -274,14 +275,14 @@ class AtlasMemoryLayer(eqx.Module):
         # Momentum scan: S_t = theta_t * S_{t-1} - eta_t * u_t
         theta = jnp.squeeze(t_c, axis=-1)         # (B, cs, H)
         mom_input = -(e_c[..., jnp.newaxis] * u)  # (B, cs, H, D, D)
-        chunk_S, S = linear_scan(S, theta, mom_input)
+        chunk_S, S = fused_linear_scan(S, theta, mom_input)
 
         # Polar Express orthogonalization
         chunk_S_orth = _pe(chunk_S, self.ns_steps)
 
         # Memory scan: M_t = alpha_t * M_{t-1} + PE(S_t)
         alpha = jnp.squeeze(a_c, axis=-1)          # (B, cs, H)
-        M_all, M = linear_scan(M, alpha, chunk_S_orth)
+        M_all, M = fused_linear_scan(M, alpha, chunk_S_orth)
 
         # Output: y_t = M_t @ q_t
         y_c = jnp.einsum('bchvk,bchk->bchv', M_all, q_c)
@@ -329,12 +330,9 @@ class AtlasMemoryLayer(eqx.Module):
 
         def _fused_scan(S_init, W_init, theta, alpha, mom_input):
             """Fused: momentum scan -> PE -> memory scan in one pass."""
-            # Momentum scan (associative)
-            chunk_S, S_final = linear_scan(S_init, theta, mom_input)
-            # PE on all positions at once (parallel)
+            chunk_S, S_final = fused_linear_scan(S_init, theta, mom_input)
             chunk_S_orth = _pe(chunk_S, self.ns_steps)
-            # Memory scan (associative)
-            W_all, W_final = linear_scan(W_init, alpha, chunk_S_orth)
+            W_all, W_final = fused_linear_scan(W_init, alpha, chunk_S_orth)
             return W_all, W_final, S_final
 
         W1_all, W1, S_W1 = _fused_scan(S_W1, W1, theta, alpha, mom_W1)

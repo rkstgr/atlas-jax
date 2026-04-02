@@ -120,8 +120,21 @@ def main():
     jax.config.update("jax_default_matmul_precision", args.matmul_precision)
     print(f"Matmul precision: {args.matmul_precision}")
 
-    print(f"JAX {jax.__version__} | devices: {jax.devices()}")
+    n_devices = len(jax.devices())
+    print(f"JAX {jax.__version__} | devices: {jax.devices()} ({n_devices} GPUs)")
     key = jax.random.PRNGKey(args.seed)
+
+    # Multi-GPU: shard batch across devices
+    if n_devices > 1:
+        from jax.sharding import Mesh, PartitionSpec, NamedSharding
+        mesh = Mesh(jax.numpy.array(jax.devices()), axis_names=('dp',))
+        data_sharding = NamedSharding(mesh, PartitionSpec('dp'))
+        replicated = NamedSharding(mesh, PartitionSpec())
+        print(f"Multi-GPU: {n_devices} devices, batch sharded on 'dp' axis")
+    else:
+        mesh = None
+        data_sharding = None
+        replicated = None
 
     config = AtlasConfig(
         sequence_len=args.seq_len,
@@ -153,6 +166,15 @@ def main():
     model = jax.tree.map(_to_bf16, model, is_leaf=eqx.is_array)
     print(f"Model cast to bf16")
 
+    # Replicate model across devices for data parallelism
+    if replicated is not None:
+        def _replicate(x):
+            if eqx.is_array(x):
+                return jax.device_put(x, replicated)
+            return x
+        model = jax.tree.map(_replicate, model, is_leaf=eqx.is_array)
+        print(f"Model replicated across {n_devices} devices")
+
     # BPB conversion
     CHARS_PER_TOKEN = 3.3
     BPB_FACTOR = 1.0 / (math.log(2) * CHARS_PER_TOKEN)
@@ -169,6 +191,9 @@ def main():
         optax.adamw(learning_rate=schedule, weight_decay=args.weight_decay),
     )
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
+    # Replicate optimizer state for multi-GPU
+    if replicated is not None:
+        opt_state = jax.device_put(opt_state, replicated)
 
     # Data
     tokenizer = get_tokenizer(args.tokenizer_dir)
@@ -178,9 +203,9 @@ def main():
         args.data_dir, tokenizer, args.batch_size, args.seq_len, split='val')
 
     tokens_per_step = args.batch_size * args.seq_len
-    gpu_peak_flops = args.gpu_peak_tflops * 1e12
+    gpu_peak_flops = args.gpu_peak_tflops * 1e12 * n_devices
 
-    print(f"Tokens/step: {tokens_per_step:,} | GPU peak: {args.gpu_peak_tflops} TFLOPS")
+    print(f"Tokens/step: {tokens_per_step:,} | GPU peak: {args.gpu_peak_tflops * n_devices} TFLOPS ({n_devices} GPUs)")
     use_time_budget = args.time_budget > 0
     if use_time_budget:
         print(f"Time budget: {args.time_budget}s")
@@ -188,10 +213,17 @@ def main():
         print(f"Training for {args.total_steps} steps")
     print("-" * 80)
 
+    # Helper to shard data for multi-GPU
+    def _shard_data(inputs, targets):
+        if data_sharding is not None:
+            inputs = jax.device_put(inputs, data_sharding)
+            targets = jax.device_put(targets, data_sharding)
+        return inputs, targets
+
     # Warmup compilation with first batch
     print("Compiling train step (first step will be slow)...")
     t_compile = time.time()
-    inputs, targets = next(train_loader)
+    inputs, targets = _shard_data(*next(train_loader))
     model, opt_state, loss = train_step(model, opt_state, optimizer, inputs, targets)
     float(loss)  # block until done
     compile_time = time.time() - t_compile
@@ -228,7 +260,7 @@ def main():
                 break
 
         t0 = time.time()
-        inputs, targets = next(train_loader)
+        inputs, targets = _shard_data(*next(train_loader))
         model, opt_state, loss = train_step(model, opt_state, optimizer, inputs, targets)
         loss_val = float(loss)
         dt = time.time() - t0
@@ -246,7 +278,7 @@ def main():
         if args.eval_every > 0 and step % args.eval_every == 0:
             val_losses = []
             for _ in range(args.eval_steps):
-                val_inputs, val_targets = next(val_loader)
+                val_inputs, val_targets = _shard_data(*next(val_loader))
                 val_loss = eval_step(model, val_inputs, val_targets)
                 val_losses.append(float(val_loss))
             avg_val_loss = sum(val_losses) / len(val_losses)

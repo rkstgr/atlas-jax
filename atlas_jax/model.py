@@ -322,17 +322,23 @@ class AtlasMemoryLayer(eqx.Module):
         theta = jnp.squeeze(t_c, axis=-1)  # (B, cs, H)
         alpha = jnp.squeeze(a_c, axis=-1)  # (B, cs, H)
 
-        # W1: momentum -> PE -> memory scan
+        # Fused momentum -> PE -> memory scan for both W1 and W2
+        # Process both weight matrices with shared gates
         mom_W1 = -(e_c[..., jnp.newaxis] * u_W1)
-        chunk_S_W1, S_W1 = linear_scan(S_W1, theta, mom_W1)
-        chunk_S_W1_orth = _pe(chunk_S_W1, self.ns_steps)
-        W1_all, W1 = linear_scan(W1, alpha, chunk_S_W1_orth)
-
-        # W2: momentum -> PE -> memory scan
         mom_W2 = -(e_c[..., jnp.newaxis] * u_W2)
-        chunk_S_W2, S_W2 = linear_scan(S_W2, theta, mom_W2)
-        chunk_S_W2_orth = _pe(chunk_S_W2, self.ns_steps)
-        W2_all, W2 = linear_scan(W2, alpha, chunk_S_W2_orth)
+
+        def _fused_scan(S_init, W_init, theta, alpha, mom_input):
+            """Fused: momentum scan -> PE -> memory scan in one pass."""
+            # Momentum scan (associative)
+            chunk_S, S_final = linear_scan(S_init, theta, mom_input)
+            # PE on all positions at once (parallel)
+            chunk_S_orth = _pe(chunk_S, self.ns_steps)
+            # Memory scan (associative)
+            W_all, W_final = linear_scan(W_init, alpha, chunk_S_orth)
+            return W_all, W_final, S_final
+
+        W1_all, W1, S_W1 = _fused_scan(S_W1, W1, theta, alpha, mom_W1)
+        W2_all, W2, S_W2 = _fused_scan(S_W2, W2, theta, alpha, mom_W2)
 
         # Output: y_t = q_t + W1_t @ GELU(W2_t @ q_t)
         h_q = jnp.einsum('bched,bchd->bche', W2_all, q_c)

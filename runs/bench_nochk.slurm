@@ -24,7 +24,7 @@ srun python -m atlas_jax.train \
     --poly-degree=3 --omega-window=16 --chunk-size=64 \
     --ns-steps=3 --pe-ste --seq-len=2048 \
     --no-checkpoint \
-    --batch-size=16 --lr=3e-3 --weight-decay=0.1 \
+    --batch-size=4 --lr=3e-3 --weight-decay=0.1 \
     --warmup-steps=100 --total-steps=10000 --time-budget=420 \
     --eval-every=200 --eval-steps=10 \
     --gpu-peak-tflops=989.4 --matmul-precision=high \

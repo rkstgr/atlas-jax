@@ -416,9 +416,11 @@ class AtlasMemoryLayer(eqx.Module):
         else:
             g_chunks = jnp.zeros_like(a_chunks)
 
-        def process_one_chunk(mem_state, q_c, k_c, v_c, a_c, e_c, t_c, g_c):
-            """Process one chunk with stop_gradient on carry."""
-            mem_state = jax.lax.stop_gradient(mem_state)
+        xs = (q_chunks, k_chunks, v_chunks, a_chunks, e_chunks, t_chunks, g_chunks)
+
+        def chunk_body(carry, chunk_data):
+            mem_state = jax.lax.stop_gradient(carry)
+            q_c, k_c, v_c, a_c, e_c, t_c, g_c = chunk_data
             if self.deep_memory:
                 y_c, new_state = self._process_chunk_deep(
                     mem_state, q_c, k_c, v_c, a_c, e_c, t_c, g_c)
@@ -427,23 +429,10 @@ class AtlasMemoryLayer(eqx.Module):
                     mem_state.M, mem_state.S, q_c, k_c, v_c, a_c, e_c, t_c, g_c)
             return new_state, y_c
 
-        if self.use_checkpoint:
-            process_one_chunk = jax.checkpoint(process_one_chunk)
+        process_fn = jax.checkpoint(chunk_body) if self.use_checkpoint else chunk_body
 
-        # Python for-loop: XLA unrolls this into a flat graph, eliminating
-        # the scan control flow overhead. Each chunk body is fused independently.
-        outputs = []
-        state = memory_state
-        for i in range(n_chunks):
-            state, y_c = process_one_chunk(
-                state,
-                q_chunks[i], k_chunks[i], v_chunks[i],
-                a_chunks[i], e_chunks[i], t_chunks[i], g_chunks[i],
-            )
-            outputs.append(y_c)
-
-        final_state = state
-        all_y = jnp.stack(outputs, axis=0)  # (n_chunks, B, cs, H, D)
+        final_state, all_y = lax.scan(process_fn, memory_state, xs)
+        # all_y: (n_chunks, B, cs, H, D) -> (B, T, H, D)
         y = jnp.transpose(all_y, (1, 0, 2, 3, 4)).reshape(B, T, H, D)
 
         # Trim padding and project back to residual stream

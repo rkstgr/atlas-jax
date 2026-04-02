@@ -70,16 +70,20 @@ def main():
     g = jax.random.uniform(key, (B, T, H), minval=0.5, maxval=0.99)
     inp = jax.random.normal(key, (B, T, H, D, D)) * 0.1
 
-    # Triton kernel is forward-only (no autograd). Check:
-    try:
-        def loss_t(h, g, i):
-            a, _ = triton_linear_scan(h, g, i)
-            return jnp.sum(a)
-        grad_t = jax.grad(loss_t)(h, g, inp)
-        print(f"  Triton grad: OK shape={grad_t.shape}")
-    except Exception as e:
-        print(f"  Triton grad: FAILED ({type(e).__name__}: {e})")
-        print("  NOTE: Triton kernel is forward-only. Need custom_vjp for backward.")
+    def loss_a(h, g, i):
+        a, f = assoc_scan(h, g, i)
+        return jnp.sum(a) + jnp.sum(f)
+    def loss_t(h, g, i):
+        a, f = triton_linear_scan(h, g, i)
+        return jnp.sum(a) + jnp.sum(f)
+
+    ga = jax.grad(loss_a, argnums=(0,1,2))(h, g, inp)
+    gt = jax.grad(loss_t, argnums=(0,1,2))(h, g, inp)
+
+    for name, a, t in zip(['grad_h', 'grad_g', 'grad_i'], ga, gt):
+        diff = float(jnp.max(jnp.abs(a - t)))
+        status = "OK" if diff < 1e-4 else "MISMATCH"
+        print(f"  {name}: max_diff={diff:.2e} [{status}]")
 
     print("\n" + "=" * 80)
 

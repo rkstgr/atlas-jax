@@ -402,8 +402,6 @@ class AtlasMemoryLayer(eqx.Module):
         n_chunks = T // cs
 
         # Pre-chunk arrays: (B, T, ...) -> (n_chunks, B, cs, ...)
-        # Pass as xs to lax.scan to avoid closing over differentiable arrays
-        # (closing over + dynamic_slice_in_dim + jax.checkpoint can produce NaN grads)
         def _chunk(x):
             return x.reshape(B, n_chunks, cs, *x.shape[2:]).transpose(1, 0, 2, *range(3, x.ndim + 1))
 
@@ -413,35 +411,39 @@ class AtlasMemoryLayer(eqx.Module):
         a_chunks = _chunk(alpha)      # (n_chunks, B, cs, H, 1)
         e_chunks = _chunk(eta)
         t_chunks = _chunk(theta)
-        # Use zeros as dummy gamma when omega_window <= 1 (scan xs must be arrays)
         if gamma is not None:
             g_chunks = _chunk(gamma)
         else:
             g_chunks = jnp.zeros_like(a_chunks)
 
-        xs = (q_chunks, k_chunks, v_chunks, a_chunks, e_chunks, t_chunks, g_chunks)
-
-        def chunk_body(carry, chunk_data):
-            # Stop gradient on carry: per the paper, gradients within each chunk
-            # are computed w.r.t. the frozen state at the chunk boundary.
-            # Without this, gradients compound across chunks and explode.
-            mem_state = jax.lax.stop_gradient(carry)
-            q_c, k_c, v_c, a_c, e_c, t_c, g_c = chunk_data
-
+        def process_one_chunk(mem_state, q_c, k_c, v_c, a_c, e_c, t_c, g_c):
+            """Process one chunk with stop_gradient on carry."""
+            mem_state = jax.lax.stop_gradient(mem_state)
             if self.deep_memory:
-                y_c, new_state = self._process_chunk_deep(mem_state, q_c, k_c, v_c, a_c, e_c, t_c, g_c)
+                y_c, new_state = self._process_chunk_deep(
+                    mem_state, q_c, k_c, v_c, a_c, e_c, t_c, g_c)
             else:
                 y_c, new_state = self._process_chunk_linear(
                     mem_state.M, mem_state.S, q_c, k_c, v_c, a_c, e_c, t_c, g_c)
-
             return new_state, y_c
 
-        process_fn = chunk_body
         if self.use_checkpoint:
-            process_fn = jax.checkpoint(chunk_body)
+            process_one_chunk = jax.checkpoint(process_one_chunk)
 
-        final_state, all_y = lax.scan(process_fn, memory_state, xs)
-        # all_y: (n_chunks, B, cs, H, D) -> (B, T, H, D)
+        # Python for-loop: XLA unrolls this into a flat graph, eliminating
+        # the scan control flow overhead. Each chunk body is fused independently.
+        outputs = []
+        state = memory_state
+        for i in range(n_chunks):
+            state, y_c = process_one_chunk(
+                state,
+                q_chunks[i], k_chunks[i], v_chunks[i],
+                a_chunks[i], e_chunks[i], t_chunks[i], g_chunks[i],
+            )
+            outputs.append(y_c)
+
+        final_state = state
+        all_y = jnp.stack(outputs, axis=0)  # (n_chunks, B, cs, H, D)
         y = jnp.transpose(all_y, (1, 0, 2, 3, 4)).reshape(B, T, H, D)
 
         # Trim padding and project back to residual stream

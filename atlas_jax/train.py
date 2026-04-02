@@ -127,7 +127,8 @@ def main():
     # Multi-GPU: shard batch across devices
     if n_devices > 1:
         from jax.sharding import Mesh, PartitionSpec, NamedSharding
-        mesh = Mesh(jax.numpy.array(jax.devices()), axis_names=('dp',))
+        import numpy as np
+        mesh = Mesh(np.array(jax.devices()), axis_names=('dp',))
         data_sharding = NamedSharding(mesh, PartitionSpec('dp'))
         replicated = NamedSharding(mesh, PartitionSpec())
         print(f"Multi-GPU: {n_devices} devices, batch sharded on 'dp' axis")

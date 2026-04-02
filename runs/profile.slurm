@@ -21,6 +21,6 @@ source .venv/bin/activate
 echo "==> GPU info:"
 nvidia-smi --query-gpu=name,memory.total --format=csv
 
-srun python profile_sweep.py
+srun python test_triton_scan.py
 
 echo "==> Done at $(date)"

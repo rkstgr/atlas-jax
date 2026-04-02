@@ -88,6 +88,7 @@ def main():
     parser.add_argument('--no-pe-ste', dest='pe_ste', action='store_false')
     parser.add_argument('--seq-len', type=int, default=2048)
     parser.add_argument('--ns-steps', type=int, default=3)
+    parser.add_argument('--no-checkpoint', action='store_true', default=False)
 
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--lr', type=float, default=3e-3)
@@ -126,6 +127,7 @@ def main():
         deep_memory=args.deep_memory,
         memory_expand=args.memory_expand,
         pe_ste=args.pe_ste,
+        use_checkpoint=not args.no_checkpoint,
     )
     print(f"Config: {asdict(config)}")
 

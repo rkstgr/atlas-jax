@@ -1,25 +1,21 @@
-"""Optimized linear scan with custom backward pass.
+"""Optimized linear scan implementations for Atlas.
 
-The key insight from nanochat's Triton kernels: the backward pass of
-a linear recurrence is itself a linear recurrence (reversed). By implementing
-a custom_vjp, we can:
-1. Avoid storing all intermediate states for backward (let lax.scan recompute)
-2. Use a reverse scan for the backward pass
-3. Flatten (B, H) into a single dimension for better GPU utilization
+Provides:
+1. associative_linear_scan: O(log n) parallel via jax.lax.associative_scan
+2. sequential_linear_scan: Simple O(n) sequential via lax.scan with (B*H, DD) flattening
 
-This eliminates the need for jax.checkpoint on the scan and avoids the
-associative_scan's O(n log n) work overhead (uses O(n) sequential instead).
+The associative scan is faster on GPU due to parallelism across timesteps.
 """
 
 import jax
 import jax.numpy as jnp
 import jax.lax as lax
-from functools import partial
 
 
-@partial(jax.custom_vjp, nondiff_argnums=())
-def fused_linear_scan(h_init, gates, inputs):
-    """Linear recurrence: h_t = gate_t * h_{t-1} + input_t.
+def associative_linear_scan(h_init, gates, inputs):
+    """Linear recurrence via associative scan (O(log n) parallel depth).
+
+    The monoid is: (g1, x1) ⊕ (g2, x2) = (g1*g2, g2*x1 + x2)
 
     Args:
         h_init: (B, H, ...) initial state
@@ -30,98 +26,69 @@ def fused_linear_scan(h_init, gates, inputs):
         h_all: (B, T, H, ...) all intermediate states
         h_final: (B, H, ...) final state
     """
-    return _scan_fwd(h_init, gates, inputs)
+    extra_dims = inputs.ndim - gates.ndim
+    gates_expanded = gates
+    for _ in range(extra_dims):
+        gates_expanded = gates_expanded[..., jnp.newaxis]
+
+    # Fold initial state into first position
+    first_x = gates_expanded[:, 0:1] * h_init[:, jnp.newaxis] + inputs[:, 0:1]
+    modified_inputs = jnp.concatenate([first_x, inputs[:, 1:]], axis=1)
+    zeros = jnp.zeros_like(gates_expanded[:, 0:1])
+    modified_gates = jnp.concatenate([zeros, gates_expanded[:, 1:]], axis=1)
+
+    def associative_fn(a, b):
+        ga, xa = a
+        gb, xb = b
+        return (ga * gb, gb * xa + xb)
+
+    _, h_all = jax.lax.associative_scan(
+        associative_fn,
+        (modified_gates, modified_inputs),
+        axis=1,
+    )
+
+    h_final = h_all[:, -1]
+    return h_all, h_final
 
 
-def _scan_fwd(h_init, gates, inputs):
-    """Forward scan: flatten (B,H) → single dim, then sequential scan."""
+def sequential_linear_scan(h_init, gates, inputs):
+    """Linear recurrence via sequential lax.scan with flattened (B*H) batch.
+
+    Simpler than associative scan, O(n) work, O(n) depth.
+    Flattening (B, H) into one dimension gives XLA a larger parallel dimension.
+
+    Args:
+        h_init: (B, H, ...) initial state
+        gates: (B, T, H) scalar gates
+        inputs: (B, T, H, ...) per-timestep inputs
+
+    Returns:
+        h_all: (B, T, H, ...) all states
+        h_final: (B, H, ...) final state
+    """
     B, T, H = gates.shape
     state_shape = h_init.shape[2:]
     DD = 1
     for s in state_shape:
         DD *= s
 
-    # Flatten: (B, H, ...) → (B*H, DD)
+    # Flatten (B, H) -> B*H for better GPU utilization
     h_flat = h_init.reshape(B * H, DD)
     inp_flat = inputs.reshape(B, T, H, DD).transpose(1, 0, 2, 3).reshape(T, B * H, DD)
     g_flat = gates.transpose(1, 0, 2).reshape(T, B * H)
 
     def step(h, gi):
         g, x = gi
-        h_new = g[:, None] * h + x
+        h_new = g[:, jnp.newaxis] * h + x
         return h_new, h_new
 
     h_final_flat, h_all_flat = lax.scan(step, h_flat, (g_flat, inp_flat))
 
-    # Unflatten
-    h_all = h_all_flat.reshape(T, B, H, *state_shape).transpose(1, 0, 2, *range(3, 3 + len(state_shape)))
+    h_all = h_all_flat.reshape(T, B, H, *state_shape)
+    # Transpose: (T, B, H, ...) -> (B, T, H, ...)
+    perm = (1, 0, 2) + tuple(range(3, 3 + len(state_shape)))
+    h_all = h_all.transpose(perm)
     h_final = h_final_flat.reshape(B, H, *state_shape)
 
     return h_all, h_final
-
-
-def fused_linear_scan_fwd(h_init, gates, inputs):
-    """Forward pass: save minimal state for backward."""
-    h_all, h_final = _scan_fwd(h_init, gates, inputs)
-    # Save h_all and gates for backward (h_init can be reconstructed)
-    return (h_all, h_final), (h_init, h_all, gates)
-
-
-def fused_linear_scan_bwd(res, g):
-    """Backward pass: reverse scan to accumulate gradients.
-
-    The gradient of a linear recurrence is itself a linear recurrence
-    running in reverse time. This is the key insight from nanochat's Triton kernel.
-    """
-    h_init, h_all, gates = res
-    grad_h_all, grad_h_final = g
-
-    B, T, H = gates.shape
-    state_shape = h_init.shape[2:]
-    DD = 1
-    for s in state_shape:
-        DD *= s
-
-    # Flatten
-    grad_all_flat = grad_h_all.reshape(B, T, H, DD).transpose(1, 0, 2, 3).reshape(T, B * H, DD)
-    grad_final_flat = grad_h_final.reshape(B * H, DD)
-
-    # Add grad_h_final to the last timestep's gradient
-    grad_all_flat = grad_all_flat.at[-1].add(grad_final_flat)
-
-    # Reverse scan: dh_acc[t] = grad[t] + gate[t+1] * dh_acc[t+1]
-    # Rewrite as forward scan on time-reversed sequences:
-    #   rev_acc[t'] = rev_gate[t'] * rev_acc[t'-1] + rev_grad[t']
-    rev_grad = grad_all_flat[::-1]  # flip time
-
-    g_flat = gates.transpose(1, 0, 2).reshape(T, B * H)
-    # Reversed gates: rev_gates[0] = 0, rev_gates[t'] = gates[T-t'] for t'>=1
-    rev_gates = jnp.concatenate([jnp.zeros_like(g_flat[:1]), g_flat[1:][::-1]], axis=0)
-
-    def step(acc, gi):
-        g, grad = gi
-        acc_new = g[:, None] * acc + grad
-        return acc_new, acc_new
-
-    zero_init = jnp.zeros((B * H, DD), dtype=h_init.dtype)
-    _, dh_acc_rev = lax.scan(step, zero_init, (rev_gates, rev_grad))
-    dh_acc = dh_acc_rev[::-1]  # (T, B*H, DD)
-
-    # grad_inputs[t] = dh_acc[t]
-    grad_inputs = dh_acc.reshape(T, B, H, *state_shape).transpose(1, 0, 2, *range(3, 3 + len(state_shape)))
-
-    # grad_gates[t] = sum_d (dh_acc[t,d] * h_{t-1,d})  → scalar per (b,t,h)
-    h_all_flat = h_all.reshape(B, T, H, DD).transpose(1, 0, 2, 3).reshape(T, B * H, DD)
-    h_init_flat = h_init.reshape(B * H, DD)
-    h_prev_flat = jnp.concatenate([h_init_flat[None], h_all_flat[:-1]], axis=0)
-    grad_gates_flat = jnp.sum(dh_acc * h_prev_flat, axis=-1)  # (T, B*H)
-    grad_gates = grad_gates_flat.reshape(T, B, H).transpose(1, 0, 2)
-
-    # grad_h_init = gate[0] * dh_acc[0]
-    gate0 = g_flat[0]  # (B*H,)
-    grad_h_init = (gate0[:, None] * dh_acc[0]).reshape(B, H, *state_shape)
-
-    return grad_h_init, grad_gates, grad_inputs
-
-
-fused_linear_scan.defvjp(fused_linear_scan_fwd, fused_linear_scan_bwd)

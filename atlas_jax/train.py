@@ -293,7 +293,7 @@ def main():
     print("Final evaluation...")
     val_losses = []
     for _ in range(args.eval_steps):
-        val_inputs, val_targets = next(val_loader)
+        val_inputs, val_targets = _shard_data(*next(val_loader))
         val_loss = eval_step(model, val_inputs, val_targets)
         val_losses.append(float(val_loss))
     avg_val_loss = sum(val_losses) / len(val_losses)

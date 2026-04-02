@@ -15,8 +15,6 @@ import argparse
 from dataclasses import asdict
 
 import jax
-# Force f32 matmul precision — TF32 on H100 causes NaN in Newton-Schulz iterations
-jax.config.update("jax_default_matmul_precision", "float32")
 import jax.numpy as jnp
 import equinox as eqx
 import optax
@@ -85,12 +83,13 @@ def main():
     parser.add_argument('--poly-degree', type=int, default=3)
     parser.add_argument('--deep-memory', action='store_true', default=True)
     parser.add_argument('--no-deep-memory', dest='deep_memory', action='store_false')
-    parser.add_argument('--memory-expand', type=int, default=4)
-    parser.add_argument('--pe-ste', action='store_true', default=False)
+    parser.add_argument('--memory-expand', type=int, default=1)
+    parser.add_argument('--pe-ste', action='store_true', default=True)
+    parser.add_argument('--no-pe-ste', dest='pe_ste', action='store_false')
     parser.add_argument('--seq-len', type=int, default=2048)
-    parser.add_argument('--ns-steps', type=int, default=5)
+    parser.add_argument('--ns-steps', type=int, default=3)
 
-    parser.add_argument('--batch-size', type=int, default=8)
+    parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--lr', type=float, default=3e-3)
     parser.add_argument('--weight-decay', type=float, default=0.1)
     parser.add_argument('--warmup-steps', type=int, default=200)
@@ -101,13 +100,18 @@ def main():
     parser.add_argument('--gpu-peak-tflops', type=float, default=989.4,
                         help='GPU peak bf16 TFLOPS for MFU calc (H100=989.4)')
 
+    parser.add_argument('--matmul-precision', type=str, default='float32',
+                        choices=['float32', 'high', 'default'])
     parser.add_argument('--data-dir', type=str, required=True)
     parser.add_argument('--tokenizer-dir', type=str, default=None)
     parser.add_argument('--out-dir', type=str, default='out/atlas-jax')
+    parser.add_argument('--time-budget', type=int, default=0,
+                        help='Training time budget in seconds (0 = use total-steps)')
 
     args = parser.parse_args()
 
-    print(f"JAX {jax.__version__} | devices: {jax.devices()}")
+    jax.config.update("jax_default_matmul_precision", args.matmul_precision)
+    print(f"JAX {jax.__version__} | devices: {jax.devices()} | precision: {args.matmul_precision}")
     key = jax.random.PRNGKey(args.seed)
 
     config = AtlasConfig(
@@ -131,6 +135,12 @@ def main():
     n_embed_params = model.wte.weight.size
     flops_per_token = estimate_flops_per_token(config, n_params, n_embed_params)
     print(f"Parameters: {n_params:,} | FLOPs/token: {flops_per_token:,.0f}")
+
+    # Cast model to bf16 (PE upcasts to f32 internally; logits cast to f32 in model)
+    def _to_bf16(x):
+        return x.astype(jnp.bfloat16) if eqx.is_array(x) and x.dtype == jnp.float32 else x
+    model = jax.tree.map(_to_bf16, model, is_leaf=eqx.is_array)
+    print(f"Model cast to bf16")
 
     # BPB conversion: BPB = loss * (1 / ln(2)) * (tokens / bytes)
     # For BPE tokenizers, ~3.3 chars/token on average for English text
@@ -164,7 +174,11 @@ def main():
     gpu_peak_flops = args.gpu_peak_tflops * 1e12
 
     print(f"Tokens/step: {tokens_per_step:,} | GPU peak: {args.gpu_peak_tflops} TFLOPS")
-    print(f"Starting training for {args.total_steps} steps...")
+    use_time_budget = args.time_budget > 0
+    if use_time_budget:
+        print(f"Time budget: {args.time_budget}s")
+    else:
+        print(f"Training for {args.total_steps} steps")
     print("-" * 80)
 
     # Warmup compilation with first batch
@@ -177,19 +191,33 @@ def main():
     print(f"Compilation done in {compile_time:.1f}s | initial loss: {float(loss):.4f}")
     print("-" * 80)
 
-    for step in range(1, args.total_steps):
+    training_start = time.time()
+    step = 0
+    step_times = []
+
+    while True:
+        step += 1
+        if use_time_budget:
+            if time.time() - training_start >= args.time_budget:
+                break
+        else:
+            if step >= args.total_steps:
+                break
+
         t0 = time.time()
         inputs, targets = next(train_loader)
         model, opt_state, loss = train_step(model, opt_state, optimizer, inputs, targets)
         loss_val = float(loss)
         dt = time.time() - t0
+        step_times.append(dt)
 
         if step % 10 == 0 or step < 5:
             tps = tokens_per_step / dt
             mfu = (flops_per_token * tps) / gpu_peak_flops * 100
             bpb = loss_val * BPB_FACTOR
+            elapsed = time.time() - training_start
             print(f"step {step:5d} | loss {loss_val:.4f} | bpb {bpb:.4f} | "
-                  f"{dt*1000:.0f}ms | {tps:.0f} tok/s | MFU {mfu:.2f}%")
+                  f"{dt*1000:.0f}ms | {tps:.0f} tok/s | MFU {mfu:.2f}% | {elapsed:.0f}s")
 
         if args.eval_every > 0 and step % args.eval_every == 0:
             val_losses = []
@@ -201,16 +229,42 @@ def main():
             val_bpb = avg_val_loss * BPB_FACTOR
             print(f"  >>> EVAL | val_loss {avg_val_loss:.4f} | val_bpb {val_bpb:.4f}")
 
+    training_seconds = time.time() - training_start
+
     # Final eval
     print("-" * 80)
     print("Final evaluation...")
     val_losses = []
-    for _ in range(50):
+    for _ in range(args.eval_steps):
         val_inputs, val_targets = next(val_loader)
         val_loss = eval_step(model, val_inputs, val_targets)
         val_losses.append(float(val_loss))
     avg_val_loss = sum(val_losses) / len(val_losses)
     val_bpb = avg_val_loss * BPB_FACTOR
+    total_seconds = time.time() - training_start
+    total_tokens = step * tokens_per_step
+
+    # Compute average MFU
+    warmup_skip = min(5, len(step_times))
+    if len(step_times) > warmup_skip:
+        avg_dt = sum(step_times[warmup_skip:]) / len(step_times[warmup_skip:])
+        avg_tps = tokens_per_step / avg_dt
+        avg_mfu = (flops_per_token * avg_tps) / gpu_peak_flops * 100
+    else:
+        avg_tps = total_tokens / max(training_seconds, 1e-6)
+        avg_mfu = (flops_per_token * avg_tps) / gpu_peak_flops * 100
+
+    print("---")
+    print(f"val_bpb:          {val_bpb:.6f}")
+    print(f"val_loss:         {avg_val_loss:.6f}")
+    print(f"training_seconds: {training_seconds:.1f}")
+    print(f"total_seconds:    {total_seconds:.1f}")
+    print(f"mfu_percent:      {avg_mfu:.2f}")
+    print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
+    print(f"num_steps:        {step}")
+    print(f"num_params_M:     {n_params / 1e6:.1f}")
+    print(f"tokens_per_sec:   {avg_tps:.0f}")
+    print(f"ms_per_step:      {avg_dt * 1000:.1f}" if len(step_times) > warmup_skip else "ms_per_step:      0.0")
     print(f"FINAL | val_loss {avg_val_loss:.4f} | val_bpb {val_bpb:.4f}")
     print("Training complete.")
 

@@ -68,11 +68,14 @@ def _omega_aggregate(u, gamma, omega_window):
 
 
 # ---------------------------------------------------------------------------
-# Linear scan via jax.lax.scan (sequential)
+# Linear scan via associative_scan (parallel, O(log n) depth)
 # ---------------------------------------------------------------------------
 
 def linear_scan(h_init, gates, inputs):
     """Linear recurrence: h_t = gate_t * h_{t-1} + input_t.
+
+    Uses associative scan for O(log n) parallel depth instead of O(n).
+    The monoid is: (g1, x1) ⊕ (g2, x2) = (g1*g2, g2*x1 + x2)
 
     Args:
         h_init: (B, H, ...) initial state
@@ -83,19 +86,36 @@ def linear_scan(h_init, gates, inputs):
         h_all: (B, T, H, ...) all intermediate states
         h_final: (B, H, ...) final state
     """
-    gates_t = jnp.moveaxis(gates, 1, 0)       # (T, B, H)
-    inputs_t = jnp.moveaxis(inputs, 1, 0)     # (T, B, H, ...)
+    # Broadcast scalar gates to match input shape: (B, T, H) -> (B, T, H, 1, ...)
+    extra_dims = inputs.ndim - gates.ndim
+    gates_expanded = gates
+    for _ in range(extra_dims):
+        gates_expanded = gates_expanded[..., jnp.newaxis]
 
-    def scan_fn(h, gi):
-        gate, inp = gi
-        g = gate
-        while g.ndim < h.ndim:
-            g = g[..., jnp.newaxis]
-        h_new = g * h + inp
-        return h_new, h_new
+    # Incorporate initial state into first position:
+    # h_0 = g_0 * h_init + x_0
+    # For subsequent positions, the scan handles it:
+    # h_t = g_t * h_{t-1} + x_t
+    first_x = gates_expanded[:, 0:1] * h_init[:, jnp.newaxis] + inputs[:, 0:1]
+    modified_inputs = jnp.concatenate([first_x, inputs[:, 1:]], axis=1)
 
-    h_final, h_all_t = lax.scan(scan_fn, h_init, (gates_t, inputs_t))
-    h_all = jnp.moveaxis(h_all_t, 0, 1)       # (B, T, H, ...)
+    # Set first gate to 0 since h_init is already folded into modified_inputs
+    zeros = jnp.zeros_like(gates_expanded[:, 0:1])
+    modified_gates = jnp.concatenate([zeros, gates_expanded[:, 1:]], axis=1)
+
+    def associative_fn(a, b):
+        ga, xa = a
+        gb, xb = b
+        return (ga * gb, gb * xa + xb)
+
+    # Run parallel associative scan over time axis (axis=1)
+    _, h_all = jax.lax.associative_scan(
+        associative_fn,
+        (modified_gates, modified_inputs),
+        axis=1,
+    )
+
+    h_final = h_all[:, -1]
     return h_all, h_final
 
 

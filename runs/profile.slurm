@@ -5,7 +5,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
-#SBATCH --time=00:15:00
+#SBATCH --time=00:30:00
 #SBATCH --job-name=atlas_prof
 #SBATCH --output=/p/scratch/westai0047/nanochat/logs/%x_%j.out
 #SBATCH --error=/p/scratch/westai0047/nanochat/logs/%x_%j.err
@@ -21,6 +21,6 @@ source .venv/bin/activate
 echo "==> GPU info:"
 nvidia-smi --query-gpu=name,memory.total --format=csv
 
-srun python profile_layer.py
+srun python profile_sweep.py
 
 echo "==> Done at $(date)"

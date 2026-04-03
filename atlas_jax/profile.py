@@ -72,10 +72,10 @@ PRESETS = {
         batch_size=1, seq_len=512,
     ),
     "h100": dict(
-        n_layer=24, n_head=16, n_embd=1536, chunk_size=64,
+        n_layer=8, n_head=8, n_embd=448, chunk_size=64,
         omega_window=16, poly_degree=3, deep_memory=True,
-        memory_expand=4, ns_steps=5, pe_ste=True,
-        batch_size=8, seq_len=2048,
+        memory_expand=1, ns_steps=3, pe_ste=True,
+        batch_size=32, seq_len=2048,
     ),
     "small_gpu": dict(
         n_layer=8, n_head=8, n_embd=448, chunk_size=64,
@@ -445,6 +445,8 @@ def main():
                         help="Use a preset config (laptop, small_gpu, h100)")
     parser.add_argument("--json", type=str, default=None,
                         help="Write JSON results to this file")
+    parser.add_argument("--trace", type=str, default=None,
+                        help="Write JAX profiler trace to this directory (view with TensorBoard or Perfetto)")
     parser.add_argument("--gpu-peak-tflops", type=float, default=None,
                         help="Override GPU peak TFLOPS for MFU calculation")
     parser.add_argument("--matmul-precision", type=str, default="float32",
@@ -506,6 +508,33 @@ def main():
     # Profile full model
     print("Profiling full model (includes compilation)...")
     model_results = profile_full_model(config, B, k2, hardware)
+
+    # Capture JAX profiler trace (post-compilation, steady-state)
+    if args.trace:
+        print(f"Capturing JAX profiler trace to {args.trace} ...")
+        model = Atlas(config, key=k2)
+        if hardware["device"] == "gpu":
+            def _to_bf16(x):
+                return x.astype(jnp.bfloat16) if eqx.is_array(x) and x.dtype == jnp.float32 else x
+            model = jax.tree.map(_to_bf16, model, is_leaf=eqx.is_array)
+        idx = jax.random.randint(k2, (B, T), 0, config.vocab_size)
+
+        @eqx.filter_jit
+        def train_step(model, idx):
+            def loss_fn(model):
+                logits, _ = model(idx)
+                return jnp.mean(logits)
+            return eqx.filter_value_and_grad(loss_fn)(model)
+
+        # Warmup (compile)
+        out = train_step(model, idx)
+        jax.block_until_ready(out)
+
+        # Traced run
+        with jax.profiler.trace(args.trace):
+            out = train_step(model, idx)
+            jax.block_until_ready(out)
+        print(f"Trace written. View with: tensorboard --logdir={args.trace}")
 
     # Output
     print()

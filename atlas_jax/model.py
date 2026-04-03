@@ -301,26 +301,29 @@ class AtlasMemoryLayer(eqx.Module):
         _pe = polar_express_ste if self.pe_ste else polar_express
 
         # Forward through frozen MLP memory
-        h = jnp.einsum('bhed,bchd->bche', W2, k_c)          # (B, cs, H, E)
-        act = jax.nn.gelu(h)                                   # (B, cs, H, E)
-        y_pred = k_c + jnp.einsum('bhde,bche->bchd', W1, act) # (B, cs, H, D)
-        err = y_pred - v_c                                      # (B, cs, H, D)
+        with jax.named_scope("mem_fwd"):
+            h = jnp.einsum('bhed,bchd->bche', W2, k_c)          # (B, cs, H, E)
+            act = jax.nn.gelu(h)                                   # (B, cs, H, E)
+            y_pred = k_c + jnp.einsum('bhde,bche->bchd', W1, act) # (B, cs, H, D)
+            err = y_pred - v_c                                      # (B, cs, H, D)
 
         # Gradient w.r.t. W1: 2 * err outer GELU(W2 @ k)
-        u_W1 = 2.0 * jnp.einsum('bchd,bche->bchde', err, act)  # (B, cs, H, D, E)
+        with jax.named_scope("mem_grad"):
+            u_W1 = 2.0 * jnp.einsum('bchd,bche->bchde', err, act)  # (B, cs, H, D, E)
 
-        # Gradient w.r.t. W2: chain through GELU' and W1^T
-        gelu_prime = _gelu_derivative(h)                          # (B, cs, H, E)
-        w1t_err = jnp.einsum('bhde,bchd->bche', W1, err)         # (B, cs, H, E)
-        chain = w1t_err * gelu_prime                               # (B, cs, H, E)
-        u_W2 = 2.0 * jnp.einsum('bche,bchd->bched', chain, k_c)  # (B, cs, H, E, D)
+            # Gradient w.r.t. W2: chain through GELU' and W1^T
+            gelu_prime = _gelu_derivative(h)                          # (B, cs, H, E)
+            w1t_err = jnp.einsum('bhde,bchd->bche', W1, err)         # (B, cs, H, E)
+            chain = w1t_err * gelu_prime                               # (B, cs, H, E)
+            u_W2 = 2.0 * jnp.einsum('bche,bchd->bched', chain, k_c)  # (B, cs, H, E, D)
 
         # Omega rule
-        if self.omega_window > 1 and g_c is not None:
-            g_w1 = g_c[..., jnp.newaxis]  # broadcast for (B, cs, H, D, E)
-            g_w2 = g_c[..., jnp.newaxis]  # broadcast for (B, cs, H, E, D)
-            u_W1 = _omega_aggregate(u_W1, g_w1, self.omega_window)
-            u_W2 = _omega_aggregate(u_W2, g_w2, self.omega_window)
+        with jax.named_scope("omega"):
+            if self.omega_window > 1 and g_c is not None:
+                g_w1 = g_c[..., jnp.newaxis]  # broadcast for (B, cs, H, D, E)
+                g_w2 = g_c[..., jnp.newaxis]  # broadcast for (B, cs, H, E, D)
+                u_W1 = _omega_aggregate(u_W1, g_w1, self.omega_window)
+                u_W2 = _omega_aggregate(u_W2, g_w2, self.omega_window)
 
         theta = jnp.squeeze(t_c, axis=-1)  # (B, cs, H)
         alpha = jnp.squeeze(a_c, axis=-1)  # (B, cs, H)
@@ -330,20 +333,26 @@ class AtlasMemoryLayer(eqx.Module):
         mom_W1 = -(e_c[..., jnp.newaxis] * u_W1)
         mom_W2 = -(e_c[..., jnp.newaxis] * u_W2)
 
-        def _fused_scan(S_init, W_init, theta, alpha, mom_input):
+        def _fused_scan(S_init, W_init, theta, alpha, mom_input, name):
             """Fused: momentum scan -> PE -> memory scan in one pass."""
-            chunk_S, S_final = linear_scan(S_init, theta, mom_input)
-            chunk_S_orth = _pe(chunk_S, self.ns_steps)
-            W_all, W_final = linear_scan(W_init, alpha, chunk_S_orth)
+            with jax.named_scope(f"{name}/momentum_scan"):
+                chunk_S, S_final = linear_scan(S_init, theta, mom_input)
+            with jax.named_scope(f"{name}/polar_express"):
+                chunk_S_orth = _pe(chunk_S, self.ns_steps)
+            with jax.named_scope(f"{name}/memory_scan"):
+                W_all, W_final = linear_scan(W_init, alpha, chunk_S_orth)
             return W_all, W_final, S_final
 
-        W1_all, W1, S_W1 = _fused_scan(S_W1, W1, theta, alpha, mom_W1)
-        W2_all, W2, S_W2 = _fused_scan(S_W2, W2, theta, alpha, mom_W2)
+        with jax.named_scope("fused_W1"):
+            W1_all, W1, S_W1 = _fused_scan(S_W1, W1, theta, alpha, mom_W1, "W1")
+        with jax.named_scope("fused_W2"):
+            W2_all, W2, S_W2 = _fused_scan(S_W2, W2, theta, alpha, mom_W2, "W2")
 
         # Output: y_t = q_t + W1_t @ GELU(W2_t @ q_t)
-        h_q = jnp.einsum('bched,bchd->bche', W2_all, q_c)
-        g_q = jax.nn.gelu(h_q)
-        y_c = q_c + jnp.einsum('bchde,bche->bchd', W1_all, g_q)
+        with jax.named_scope("mem_output"):
+            h_q = jnp.einsum('bched,bchd->bche', W2_all, q_c)
+            g_q = jax.nn.gelu(h_q)
+            y_c = q_c + jnp.einsum('bchde,bche->bchd', W1_all, g_q)
 
         return y_c, DeepMemoryState(W1=W1, W2=W2, S_W1=S_W1, S_W2=S_W2)
 
@@ -354,26 +363,29 @@ class AtlasMemoryLayer(eqx.Module):
         cs = self.chunk_size
 
         # Project (direct matmul, no vmap overhead) + short causal conv + multi-head reshape
-        q = self.conv_q((x @ self.c_q.weight.T).reshape(B, T, C)).reshape(B, T, H, D)
-        k = self.conv_k((x @ self.c_k.weight.T).reshape(B, T, C)).reshape(B, T, H, D)
-        v = self.conv_v((x @ self.c_v.weight.T).reshape(B, T, C)).reshape(B, T, H, D)
+        with jax.named_scope("qkv_proj"):
+            q = self.conv_q((x @ self.c_q.weight.T).reshape(B, T, C)).reshape(B, T, H, D)
+            k = self.conv_k((x @ self.c_k.weight.T).reshape(B, T, C)).reshape(B, T, H, D)
+            v = self.conv_v((x @ self.c_v.weight.T).reshape(B, T, C)).reshape(B, T, H, D)
 
         # Normalize Q, K for stable memory operations
-        q, k = rms_norm(q), rms_norm(k)
+        with jax.named_scope("qk_norm_poly"):
+            q, k = rms_norm(q), rms_norm(k)
 
-        # Polynomial feature mapping
-        if self.poly_degree > 0:
-            q = self._poly_features(q)
-            k = self._poly_features(k)
+            # Polynomial feature mapping
+            if self.poly_degree > 0:
+                q = self._poly_features(q)
+                k = self._poly_features(k)
 
         # Input-dependent gates via sigmoid (direct matmul)
-        alpha = jax.nn.sigmoid((x @ self.gate_alpha.weight.T).reshape(B, T, H, 1))
-        eta = jax.nn.sigmoid((x @ self.gate_eta.weight.T).reshape(B, T, H, 1))
-        theta = jax.nn.sigmoid((x @ self.gate_theta.weight.T).reshape(B, T, H, 1))
+        with jax.named_scope("gates"):
+            alpha = jax.nn.sigmoid((x @ self.gate_alpha.weight.T).reshape(B, T, H, 1))
+            eta = jax.nn.sigmoid((x @ self.gate_eta.weight.T).reshape(B, T, H, 1))
+            theta = jax.nn.sigmoid((x @ self.gate_theta.weight.T).reshape(B, T, H, 1))
 
-        gamma = None
-        if self.omega_window > 1 and self.gate_gamma is not None:
-            gamma = jax.nn.sigmoid((x @ self.gate_gamma.weight.T).reshape(B, T, H, 1))
+            gamma = None
+            if self.omega_window > 1 and self.gate_gamma is not None:
+                gamma = jax.nn.sigmoid((x @ self.gate_gamma.weight.T).reshape(B, T, H, 1))
 
         # Initialize memory state if needed
         if memory_state is None:

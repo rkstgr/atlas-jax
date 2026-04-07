@@ -30,6 +30,27 @@ try:
 except ImportError:
     _USE_TRITON_SCAN = False
 
+# Try to use FlashATLAS fused chunk kernel (Triton first, then Pallas fallback)
+try:
+    from atlas_jax.fused_chunk import fused_chunk_scan, fused_chunk_available
+    _HAS_FUSED_CHUNK = fused_chunk_available()
+except ImportError:
+    _HAS_FUSED_CHUNK = False
+
+if not _HAS_FUSED_CHUNK:
+    try:
+        from atlas_jax.pallas_fused import fused_chunk_scan, pallas_available
+        _HAS_FUSED_CHUNK = pallas_available()
+    except ImportError:
+        pass
+
+# Try to use fused Triton PE (single kernel for all NS iterations)
+try:
+    from atlas_jax.triton_pe import triton_polar_express, triton_polar_express_ste
+    _HAS_TRITON_PE = True
+except ImportError:
+    _HAS_TRITON_PE = False
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -205,6 +226,7 @@ class AtlasMemoryLayer(eqx.Module):
     deep_memory: bool = eqx.field(static=True)
     pe_ste: bool = eqx.field(static=True)
     use_checkpoint: bool = eqx.field(static=True)
+    fused_chunk: bool = eqx.field(static=True)
 
     def __init__(self, config: AtlasConfig, *, key):
         keys = jax.random.split(key, 12)
@@ -222,6 +244,7 @@ class AtlasMemoryLayer(eqx.Module):
         self.deep_memory = config.deep_memory
         self.pe_ste = config.pe_ste
         self.use_checkpoint = config.use_checkpoint
+        self.fused_chunk = config.fused_chunk and _HAS_FUSED_CHUNK
 
         C = config.n_embd
         self.c_q = eqx.nn.Linear(C, C, use_bias=False, key=keys[0])
@@ -298,7 +321,10 @@ class AtlasMemoryLayer(eqx.Module):
         Gradients computed analytically w.r.t. W1 and W2.
         """
         W1, W2, S_W1, S_W2 = state.W1, state.W2, state.S_W1, state.S_W2
-        _pe = polar_express_ste if self.pe_ste else polar_express
+        if _HAS_TRITON_PE:
+            _pe = triton_polar_express_ste if self.pe_ste else triton_polar_express
+        else:
+            _pe = polar_express_ste if self.pe_ste else polar_express
 
         # Forward through frozen MLP memory
         with jax.named_scope("mem_fwd"):
@@ -333,20 +359,69 @@ class AtlasMemoryLayer(eqx.Module):
         mom_W1 = -(e_c[..., jnp.newaxis] * u_W1)
         mom_W2 = -(e_c[..., jnp.newaxis] * u_W2)
 
-        def _fused_scan(S_init, W_init, theta, alpha, mom_input, name):
-            """Fused: momentum scan -> PE -> memory scan in one pass."""
-            with jax.named_scope(f"{name}/momentum_scan"):
-                chunk_S, S_final = linear_scan(S_init, theta, mom_input)
-            with jax.named_scope(f"{name}/polar_express"):
-                chunk_S_orth = _pe(chunk_S, self.ns_steps)
-            with jax.named_scope(f"{name}/memory_scan"):
-                W_all, W_final = linear_scan(W_init, alpha, chunk_S_orth)
-            return W_all, W_final, S_final
+        if self.fused_chunk:
+            # FlashATLAS: single Triton kernel keeps carry in SRAM
+            with jax.named_scope("flash_atlas"):
+                y_c, new_state = fused_chunk_scan(
+                    W1, W2, S_W1, S_W2,
+                    mom_W1, mom_W2, theta, alpha, q_c,
+                    self.ns_steps, self.pe_ste)
+            return y_c, new_state
 
-        with jax.named_scope("fused_W1"):
-            W1_all, W1, S_W1 = _fused_scan(S_W1, W1, theta, alpha, mom_W1, "W1")
-        with jax.named_scope("fused_W2"):
-            W2_all, W2, S_W2 = _fused_scan(S_W2, W2, theta, alpha, mom_W2, "W2")
+        # Batched path: when D==E, stack W1/W2 to halve kernel launches
+        # (2 momentum scans -> 1, 2 PE calls -> 1, 2 memory scans -> 1)
+        D, E = self.head_dim, self.expand_dim
+        if D == E:
+            with jax.named_scope("batched_momentum_scan"):
+                # Stack: (B, H, D, D) x2 -> (B, H, 2, D, D) -> flatten to (B, H, 2*D*D)
+                S_cat = jnp.concatenate(
+                    [S_W1.reshape(*S_W1.shape[:2], -1),
+                     S_W2.reshape(*S_W2.shape[:2], -1)], axis=-1)
+                mom_cat = jnp.concatenate(
+                    [mom_W1.reshape(*mom_W1.shape[:3], -1),
+                     mom_W2.reshape(*mom_W2.shape[:3], -1)], axis=-1)
+                chunk_S_cat, S_final_cat = linear_scan(S_cat, theta, mom_cat)
+                DD = D * E
+                chunk_S_W1 = chunk_S_cat[..., :DD].reshape(*chunk_S_cat.shape[:3], D, E)
+                chunk_S_W2 = chunk_S_cat[..., DD:].reshape(*chunk_S_cat.shape[:3], E, D)
+                S_W1 = S_final_cat[..., :DD].reshape(*S_final_cat.shape[:2], D, E)
+                S_W2 = S_final_cat[..., DD:].reshape(*S_final_cat.shape[:2], E, D)
+
+            with jax.named_scope("batched_polar_express"):
+                # Stack along dim 3: (B, cs, H, D, D) x2 -> (B, cs, H, 2, D, D)
+                # PE operates on last 2 dims, batch dims are transparent
+                stacked_S = jnp.stack([chunk_S_W1, chunk_S_W2], axis=3)
+                stacked_orth = _pe(stacked_S, self.ns_steps)
+                chunk_S_W1_orth = stacked_orth[:, :, :, 0]
+                chunk_S_W2_orth = stacked_orth[:, :, :, 1]
+
+            with jax.named_scope("batched_memory_scan"):
+                W_cat = jnp.concatenate(
+                    [W1.reshape(*W1.shape[:2], -1),
+                     W2.reshape(*W2.shape[:2], -1)], axis=-1)
+                orth_cat = jnp.concatenate(
+                    [chunk_S_W1_orth.reshape(*chunk_S_W1_orth.shape[:3], -1),
+                     chunk_S_W2_orth.reshape(*chunk_S_W2_orth.shape[:3], -1)], axis=-1)
+                W_all_cat, W_final_cat = linear_scan(W_cat, alpha, orth_cat)
+                W1_all = W_all_cat[..., :DD].reshape(*W_all_cat.shape[:3], D, E)
+                W2_all = W_all_cat[..., DD:].reshape(*W_all_cat.shape[:3], E, D)
+                W1 = W_final_cat[..., :DD].reshape(*W_final_cat.shape[:2], D, E)
+                W2 = W_final_cat[..., DD:].reshape(*W_final_cat.shape[:2], E, D)
+        else:
+            # Fallback: separate scan + PE + scan for each weight matrix
+            def _fused_scan(S_init, W_init, theta, alpha, mom_input, name):
+                with jax.named_scope(f"{name}/momentum_scan"):
+                    chunk_S, S_final = linear_scan(S_init, theta, mom_input)
+                with jax.named_scope(f"{name}/polar_express"):
+                    chunk_S_orth = _pe(chunk_S, self.ns_steps)
+                with jax.named_scope(f"{name}/memory_scan"):
+                    W_all, W_final = linear_scan(W_init, alpha, chunk_S_orth)
+                return W_all, W_final, S_final
+
+            with jax.named_scope("fused_W1"):
+                W1_all, W1, S_W1 = _fused_scan(S_W1, W1, theta, alpha, mom_W1, "W1")
+            with jax.named_scope("fused_W2"):
+                W2_all, W2, S_W2 = _fused_scan(S_W2, W2, theta, alpha, mom_W2, "W2")
 
         # Output: y_t = q_t + W1_t @ GELU(W2_t @ q_t)
         with jax.named_scope("mem_output"):
@@ -419,23 +494,6 @@ class AtlasMemoryLayer(eqx.Module):
 
         n_chunks = T // cs
 
-        # Pre-chunk arrays: (B, T, ...) -> (n_chunks, B, cs, ...)
-        def _chunk(x):
-            return x.reshape(B, n_chunks, cs, *x.shape[2:]).transpose(1, 0, 2, *range(3, x.ndim + 1))
-
-        q_chunks = _chunk(q)          # (n_chunks, B, cs, H, D)
-        k_chunks = _chunk(k)
-        v_chunks = _chunk(v)
-        a_chunks = _chunk(alpha)      # (n_chunks, B, cs, H, 1)
-        e_chunks = _chunk(eta)
-        t_chunks = _chunk(theta)
-        if gamma is not None:
-            g_chunks = _chunk(gamma)
-        else:
-            g_chunks = jnp.zeros_like(a_chunks)
-
-        xs = (q_chunks, k_chunks, v_chunks, a_chunks, e_chunks, t_chunks, g_chunks)
-
         def chunk_body(carry, chunk_data):
             mem_state = jax.lax.stop_gradient(carry)
             q_c, k_c, v_c, a_c, e_c, t_c, g_c = chunk_data
@@ -449,9 +507,53 @@ class AtlasMemoryLayer(eqx.Module):
 
         process_fn = jax.checkpoint(chunk_body) if self.use_checkpoint else chunk_body
 
-        final_state, all_y = lax.scan(process_fn, memory_state, xs)
-        # all_y: (n_chunks, B, cs, H, D) -> (B, T, H, D)
-        y = jnp.transpose(all_y, (1, 0, 2, 3, 4)).reshape(B, T, H, D)
+        if self.fused_chunk:
+            # Unrolled Python for-loop with transpose-free chunking.
+            # Keep (B, n_chunks, cs, ...) layout and index with [:, i] —
+            # avoids the (n_chunks, B, cs, ...) transpose that costs ~255ms.
+            def _chunk_bt(x):
+                return x.reshape(B, n_chunks, cs, *x.shape[2:])
+
+            q_bt = _chunk_bt(q)
+            k_bt = _chunk_bt(k)
+            v_bt = _chunk_bt(v)
+            a_bt = _chunk_bt(alpha)
+            e_bt = _chunk_bt(eta)
+            t_bt = _chunk_bt(theta)
+            g_bt = _chunk_bt(gamma) if gamma is not None else jnp.zeros_like(a_bt)
+
+            ys = []
+            state = memory_state
+            for i in range(n_chunks):
+                chunk_data = (q_bt[:, i], k_bt[:, i], v_bt[:, i],
+                              a_bt[:, i], e_bt[:, i], t_bt[:, i], g_bt[:, i])
+                state, y_c = process_fn(state, chunk_data)
+                ys.append(y_c)
+            final_state = state
+            all_y = jnp.stack(ys, axis=1)  # (B, n_chunks, cs, H, D) — no transpose
+        else:
+            # lax.scan path: needs (n_chunks, B, cs, ...) for the scan axis
+            def _chunk(x):
+                return x.reshape(B, n_chunks, cs, *x.shape[2:]).transpose(1, 0, 2, *range(3, x.ndim + 1))
+
+            q_chunks = _chunk(q)
+            k_chunks = _chunk(k)
+            v_chunks = _chunk(v)
+            a_chunks = _chunk(alpha)
+            e_chunks = _chunk(eta)
+            t_chunks = _chunk(theta)
+            g_chunks = _chunk(gamma) if gamma is not None else jnp.zeros_like(a_chunks)
+
+            xs = (q_chunks, k_chunks, v_chunks, a_chunks, e_chunks, t_chunks, g_chunks)
+            final_state, all_y = lax.scan(process_fn, memory_state, xs)
+
+        # all_y -> (B, T, H, D)
+        if self.fused_chunk:
+            # (B, n_chunks, cs, H, D) — already B-first, just reshape
+            y = all_y.reshape(B, T, H, D)
+        else:
+            # (n_chunks, B, cs, H, D) — needs transpose
+            y = jnp.transpose(all_y, (1, 0, 2, 3, 4)).reshape(B, T, H, D)
 
         # Trim padding and project back to residual stream
         y = y[:, :T_orig].reshape(B, T_orig, -1)

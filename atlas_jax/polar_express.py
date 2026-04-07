@@ -71,3 +71,22 @@ def polar_express_ste(X, steps=5):
     orthogonal matrix. Near-orthogonal matrices have Jacobian ~ identity.
     """
     return X + jax.lax.stop_gradient(polar_express(X, steps) - X)
+
+
+def frobenius_clip(X, steps=None):
+    """Frobenius norm clipping: X / max(||X||_F, 1.0).
+
+    Cheap alternative to full PE orthogonalization. Constrains the momentum
+    magnitude without the expensive Newton-Schulz matmuls.
+    The `steps` argument is accepted but ignored (for API compatibility with PE).
+    """
+    orig_dtype = X.dtype
+    X = X.astype(jnp.float32)
+    frob_norm = jnp.sqrt(jnp.sum(X * X, axis=(-2, -1), keepdims=True) + 1e-12)
+    X = X / jnp.maximum(frob_norm, 1.0)
+    return X.astype(orig_dtype)
+
+
+def frobenius_clip_ste(X, steps=None):
+    """Frobenius clipping with straight-through estimator."""
+    return X + jax.lax.stop_gradient(frobenius_clip(X) - X)

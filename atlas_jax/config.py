@@ -19,3 +19,4 @@ class AtlasConfig:
     memory_expand: int = 4     # MLP expansion factor for deep memory (paper default = 4)
     pe_ste: bool = False       # Polar Express straight-through estimator
     use_checkpoint: bool = True  # gradient checkpointing per chunk
+    fused_chunk: bool = False   # FlashATLAS: fused Triton kernel for inner scan+PE+memory+output

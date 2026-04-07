@@ -47,7 +47,7 @@ def estimate_flops_per_token(config, n_params, n_embed_params):
 # Train / eval steps
 # ---------------------------------------------------------------------------
 
-@eqx.filter_jit
+@eqx.filter_jit(donate='warn')
 def train_step(model, opt_state, optimizer, inputs, targets):
     def loss_fn(model):
         logits, _ = model(inputs)
@@ -89,6 +89,8 @@ def main():
     parser.add_argument('--seq-len', type=int, default=2048)
     parser.add_argument('--ns-steps', type=int, default=3)
     parser.add_argument('--no-checkpoint', action='store_true', default=False)
+    parser.add_argument('--fused-chunk', action='store_true', default=False,
+                        help='FlashATLAS fused Triton kernel (requires memory-expand=1)')
 
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--lr', type=float, default=3e-3)
@@ -108,9 +110,14 @@ def main():
     parser.add_argument('--out-dir', type=str, default='out/atlas-jax')
     parser.add_argument('--time-budget', type=int, default=0,
                         help='Training time budget in seconds (0 = use total-steps)')
+    parser.add_argument('--max-tokens', type=float, default=0,
+                        help='Max tokens to train on (0 = no limit). Accepts scientific notation e.g. 5.6e9')
+    parser.add_argument('--target-bpb', type=float, default=0,
+                        help='Stop early if val_bpb reaches this target (0 = disabled)')
 
     args = parser.parse_args()
 
+    jax.config.update("jax_compilation_cache_dir", "/p/scratch/westai0047/nanochat/jax_cache")
     jax.config.update("jax_default_matmul_precision", args.matmul_precision)
     print(f"JAX {jax.__version__} | devices: {jax.devices()} | precision: {args.matmul_precision}")
     key = jax.random.PRNGKey(args.seed)
@@ -128,6 +135,7 @@ def main():
         memory_expand=args.memory_expand,
         pe_ste=args.pe_ste,
         use_checkpoint=not args.no_checkpoint,
+        fused_chunk=args.fused_chunk,
     )
     print(f"Config: {asdict(config)}")
 
@@ -174,6 +182,14 @@ def main():
 
     tokens_per_step = args.batch_size * args.seq_len
     gpu_peak_flops = args.gpu_peak_tflops * 1e12
+
+    # Override total_steps if max-tokens is set
+    if args.max_tokens > 0:
+        max_steps = int(args.max_tokens / tokens_per_step)
+        args.total_steps = max_steps
+        print(f"Max tokens: {args.max_tokens:.2e} → {max_steps} steps")
+    if args.target_bpb > 0:
+        print(f"Early stopping target: val_bpb <= {args.target_bpb}")
 
     print(f"Tokens/step: {tokens_per_step:,} | GPU peak: {args.gpu_peak_tflops} TFLOPS")
     use_time_budget = args.time_budget > 0
@@ -229,7 +245,11 @@ def main():
                 val_losses.append(float(val_loss))
             avg_val_loss = sum(val_losses) / len(val_losses)
             val_bpb = avg_val_loss * BPB_FACTOR
-            print(f"  >>> EVAL | val_loss {avg_val_loss:.4f} | val_bpb {val_bpb:.4f}")
+            total_tok = step * tokens_per_step
+            print(f"  >>> EVAL | val_loss {avg_val_loss:.4f} | val_bpb {val_bpb:.4f} | tokens {total_tok/1e6:.0f}M")
+            if args.target_bpb > 0 and val_bpb <= args.target_bpb:
+                print(f"  >>> TARGET REACHED: val_bpb {val_bpb:.4f} <= {args.target_bpb}")
+                break
 
     training_seconds = time.time() - training_start
 

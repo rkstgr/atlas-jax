@@ -676,7 +676,7 @@ def _make_initial_memory_states(n_layer, B, H, D, E, deep_memory, dtype):
 
 class Atlas(eqx.Module):
     wte: eqx.nn.Embedding
-    blocks: Block  # Stacked: each array leaf has leading n_layer dim (for lax.scan)
+    blocks: list[Block]  # List for optimizer compatibility (Muon needs 2D leaves)
     lm_head: eqx.nn.Linear
     config: AtlasConfig = eqx.field(static=True)
     padded_vocab_size: int = eqx.field(static=True)
@@ -690,12 +690,11 @@ class Atlas(eqx.Module):
 
         self.wte = eqx.nn.Embedding(padded_vocab_size, config.n_embd, key=keys[0])
 
-        # Create blocks as list, apply weight init, then stack for scan-over-layers.
-        # Stacking reduces the XLA graph from O(n_layer) unrolled blocks to a single
-        # loop body, cutting compilation time from ~30min to ~2min for 21 layers.
+        # Create blocks as list and apply weight init.
+        # Kept as list so the optimizer sees 2D weight leaves (Muon needs this).
+        # Stacking for scan-over-layers happens inside __call__ (traced under JIT).
         blocks_list = [Block(config, key=keys[i + 1]) for i in range(config.n_layer)]
-        blocks_list = _init_block_weights(blocks_list, keys[-2])
-        self.blocks = jax.tree.map(lambda *xs: jnp.stack(xs), *blocks_list)
+        self.blocks = _init_block_weights(blocks_list, keys[-2])
 
         self.lm_head = eqx.nn.Linear(config.n_embd, padded_vocab_size, use_bias=False, key=keys[-1])
         # Small lm_head init so initial logits are small
@@ -726,6 +725,11 @@ class Atlas(eqx.Module):
         x = self.wte.weight[idx]  # (B, T, C)
         x = rms_norm(x)
 
+        # Stack blocks for scan-over-layers (traced under JIT, compiled to loop).
+        # Blocks are stored as a list (for optimizer compatibility) but stacked here
+        # so XLA sees one loop body instead of n_layer unrolled copies.
+        stacked_blocks = jax.tree.map(lambda *xs: jnp.stack(xs), *self.blocks)
+
         # Prepare stacked memory states with leading n_layer dim
         if memory_states is None:
             stacked_states = _make_initial_memory_states(
@@ -741,7 +745,7 @@ class Atlas(eqx.Module):
             x = x + block.mlp(rms_norm(x))
             return x, new_state
 
-        x, new_states_stacked = lax.scan(scan_fn, x, (self.blocks, stacked_states))
+        x, new_states_stacked = lax.scan(scan_fn, x, (stacked_blocks, stacked_states))
 
         x = rms_norm(x)
 

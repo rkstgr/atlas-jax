@@ -46,6 +46,7 @@ from atlas_jax.model import Atlas
 from atlas_jax.data import data_loader
 from atlas_jax.tokenizer import get_tokenizer
 from atlas_jax.train import estimate_flops_per_token
+from atlas_jax.optim import build_optimizer
 
 
 # ---------------------------------------------------------------------------
@@ -169,9 +170,20 @@ def main():
 
     parser.add_argument('--batch-size', type=int, default=32,
                         help='GLOBAL batch size (split across all GPUs)')
-    parser.add_argument('--lr', type=float, default=3e-3)
-    parser.add_argument('--weight-decay', type=float, default=0.1)
-    parser.add_argument('--warmup-steps', type=int, default=200)
+    parser.add_argument('--optimizer', type=str, default='muon',
+                        choices=['muon', 'adamw'],
+                        help='Optimizer: muon (Muon+AdamW hybrid) or adamw (plain AdamW)')
+    parser.add_argument('--lr', type=float, default=0.02,
+                        help='Matrix LR for Muon / base LR for AdamW')
+    parser.add_argument('--embedding-lr', type=float, default=0.004)
+    parser.add_argument('--lm-head-lr', type=float, default=0.004)
+    parser.add_argument('--scalar-lr', type=float, default=0.05)
+    parser.add_argument('--weight-decay', type=float, default=0.0)
+    parser.add_argument('--muon-momentum', type=float, default=0.95)
+    parser.add_argument('--muon-ns-steps', type=int, default=5)
+    parser.add_argument('--warmup-steps', type=int, default=40)
+    parser.add_argument('--warmdown-steps', type=int, default=0,
+                        help='Linear warmdown steps at end (0 = no warmdown)')
     parser.add_argument('--total-steps', type=int, default=2000)
     parser.add_argument('--eval-every', type=int, default=200)
     parser.add_argument('--eval-steps', type=int, default=20)
@@ -243,17 +255,37 @@ def main():
     CHARS_PER_TOKEN = 3.3
     BPB_FACTOR = 1.0 / (math.log(2) * CHARS_PER_TOKEN)
 
-    schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0,
-        peak_value=args.lr,
-        warmup_steps=args.warmup_steps,
-        decay_steps=args.total_steps,
-        end_value=args.lr * 0.01,
-    )
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(1.0),
-        optax.adamw(learning_rate=schedule, weight_decay=args.weight_decay),
-    )
+    if args.optimizer == 'muon':
+        optimizer, param_labels = build_optimizer(
+            model,
+            matrix_lr=args.lr,
+            embedding_lr=args.embedding_lr,
+            lm_head_lr=args.lm_head_lr,
+            scalar_lr=args.scalar_lr,
+            muon_wd=args.weight_decay,
+            muon_momentum=args.muon_momentum,
+            muon_ns_steps=args.muon_ns_steps,
+            warmup_steps=args.warmup_steps,
+            total_steps=args.total_steps,
+            warmdown_steps=args.warmdown_steps,
+            n_embd=args.n_embd,
+        )
+        log(f"Optimizer: Muon+AdamW hybrid (matrix_lr={args.lr}, "
+            f"emb_lr={args.embedding_lr}, scalar_lr={args.scalar_lr})")
+    else:
+        schedule = optax.warmup_cosine_decay_schedule(
+            init_value=0.0,
+            peak_value=args.lr,
+            warmup_steps=args.warmup_steps,
+            decay_steps=args.total_steps,
+            end_value=args.lr * 0.01,
+        )
+        optimizer = optax.chain(
+            optax.clip_by_global_norm(1.0),
+            optax.adamw(learning_rate=schedule, weight_decay=args.weight_decay),
+        )
+        log(f"Optimizer: AdamW (lr={args.lr}, wd={args.weight_decay})")
+
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
     # Replicate model and opt_state across all devices

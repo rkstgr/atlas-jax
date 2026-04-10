@@ -564,8 +564,14 @@ class AtlasMemoryLayer(eqx.Module):
             # (n_chunks, B, cs, H, D) — needs transpose
             y = jnp.transpose(all_y, (1, 0, 2, 3, 4)).reshape(B, T, H, D)
 
-        # Trim padding and project back to residual stream
+        # Trim padding and project back to residual stream.
+        # Stop-gradient norm bounds gradient magnitude through the memory layer.
+        # The memory backward has spectral norm ~100× per layer; without this,
+        # gradients overflow at 16+ layers even with tiny c_proj init.
         y = y[:, :T_orig].reshape(B, T_orig, -1)
+        scale = jax.lax.stop_gradient(
+            jax.lax.rsqrt(jnp.mean(y * y, axis=-1, keepdims=True) + 1e-6))
+        y = y * scale
         y = (y @ self.c_proj.weight.T).reshape(B, T_orig, C)
 
         return y, final_state

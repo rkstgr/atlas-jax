@@ -209,7 +209,12 @@ def _label_params(model):
             labels.append('embedding')
         elif 'lm_head' in path_str and 'weight' in path_str:
             labels.append('lm_head')
-        elif hasattr(leaf, 'ndim') and leaf.ndim == 2 and 'blocks' in path_str:
+        elif ('blocks' in path_str and 'weight' in path_str
+              and 'conv' not in path_str
+              and hasattr(leaf, 'ndim') and leaf.ndim >= 2):
+            # Linear weight matrices in blocks → Muon.
+            # With scan-over-layers stacking, these are ndim 3 (n_layer, out, in).
+            # Conv weights are excluded ('conv' in path) — they go to scalar.
             labels.append('muon')
         else:
             labels.append('scalar')

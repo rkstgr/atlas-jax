@@ -613,12 +613,70 @@ class Block(eqx.Module):
 
 
 # ---------------------------------------------------------------------------
+# Weight initialization + memory state helpers
+# ---------------------------------------------------------------------------
+
+def _init_block_weights(blocks_list, key):
+    """Initialize block weights for stable training.
+
+    Critical: zero output projections so residual blocks start as identity.
+    Small gates so sigmoid ≈ 0.5.
+
+    Operates on a list of Blocks (before stacking) and returns the modified list.
+    """
+    n = len(blocks_list)
+    keys = jax.random.split(key, 4 * n + 1)
+    ki = 0
+
+    for i in range(n):
+        # Memory output projection: ZERO (blocks start as identity)
+        blocks_list[i] = eqx.tree_at(
+            lambda b: b.memory.c_proj.weight, blocks_list[i],
+            jnp.zeros_like(blocks_list[i].memory.c_proj.weight))
+        # MLP output projection: ZERO
+        blocks_list[i] = eqx.tree_at(
+            lambda b: b.mlp.c_proj.weight, blocks_list[i],
+            jnp.zeros_like(blocks_list[i].mlp.c_proj.weight))
+        # Gates: small init
+        for attr in ['gate_alpha', 'gate_eta', 'gate_theta']:
+            w = getattr(blocks_list[i].memory, attr).weight
+            blocks_list[i] = eqx.tree_at(
+                lambda b, a=attr: getattr(b.memory, a).weight, blocks_list[i],
+                jax.random.normal(keys[ki], w.shape) * 0.01)
+            ki += 1
+        if blocks_list[i].memory.gate_gamma is not None:
+            w = blocks_list[i].memory.gate_gamma.weight
+            blocks_list[i] = eqx.tree_at(
+                lambda b: b.memory.gate_gamma.weight, blocks_list[i],
+                jax.random.normal(keys[ki], w.shape) * 0.01)
+            ki += 1
+
+    return blocks_list
+
+
+def _make_initial_memory_states(n_layer, B, H, D, E, deep_memory, dtype):
+    """Create stacked initial memory states with leading n_layer dim."""
+    if deep_memory:
+        W1 = jnp.zeros((n_layer, B, H, D, E), dtype=dtype)
+        W2 = jnp.zeros((n_layer, B, H, E, D), dtype=dtype)
+        eye = jnp.eye(min(E, D), dtype=dtype)
+        W2 = W2.at[:, :, :, :min(E, D), :min(E, D)].set(eye)
+        S_W1 = jnp.zeros((n_layer, B, H, D, E), dtype=dtype)
+        S_W2 = jnp.zeros((n_layer, B, H, E, D), dtype=dtype)
+        return DeepMemoryState(W1=W1, W2=W2, S_W1=S_W1, S_W2=S_W2)
+    else:
+        M = jnp.zeros((n_layer, B, H, D, D), dtype=dtype)
+        S = jnp.zeros((n_layer, B, H, D, D), dtype=dtype)
+        return LinearMemoryState(M=M, S=S)
+
+
+# ---------------------------------------------------------------------------
 # Atlas (full model)
 # ---------------------------------------------------------------------------
 
 class Atlas(eqx.Module):
     wte: eqx.nn.Embedding
-    blocks: list[Block]
+    blocks: Block  # Stacked: each array leaf has leading n_layer dim (for lax.scan)
     lm_head: eqx.nn.Linear
     config: AtlasConfig = eqx.field(static=True)
     padded_vocab_size: int = eqx.field(static=True)
@@ -631,51 +689,23 @@ class Atlas(eqx.Module):
         self.config = config
 
         self.wte = eqx.nn.Embedding(padded_vocab_size, config.n_embd, key=keys[0])
-        self.blocks = [Block(config, key=keys[i + 1]) for i in range(config.n_layer)]
+
+        # Create blocks as list, apply weight init, then stack for scan-over-layers.
+        # Stacking reduces the XLA graph from O(n_layer) unrolled blocks to a single
+        # loop body, cutting compilation time from ~30min to ~2min for 21 layers.
+        blocks_list = [Block(config, key=keys[i + 1]) for i in range(config.n_layer)]
+        blocks_list = _init_block_weights(blocks_list, keys[-2])
+        self.blocks = jax.tree.map(lambda *xs: jnp.stack(xs), *blocks_list)
+
         self.lm_head = eqx.nn.Linear(config.n_embd, padded_vocab_size, use_bias=False, key=keys[-1])
-
-        # Re-initialize weights following the paper / nanochat convention
-        self = self._init_weights(keys[-2])
-
-    def _init_weights(self, key):
-        """Reinitialize for stable training.
-
-        Critical: zero output projections so residual blocks start as identity.
-        Small gates so sigmoid ≈ 0.5. Small lm_head so initial logits are small.
-        """
-        model = self
-        keys = jax.random.split(key, 10 + 2 * len(model.blocks))
-        ki = 0
-
-        # lm_head: small init
-        model = eqx.tree_at(lambda m: m.lm_head.weight,
-            model, jax.random.normal(keys[ki], model.lm_head.weight.shape) * 0.02)
-        ki += 1
-
-        for i in range(len(model.blocks)):
-            # Memory output projection: ZERO (blocks start as identity)
-            model = eqx.tree_at(lambda m, j=i: m.blocks[j].memory.c_proj.weight,
-                model, jnp.zeros_like(model.blocks[i].memory.c_proj.weight))
-            # MLP output projection: ZERO
-            model = eqx.tree_at(lambda m, j=i: m.blocks[j].mlp.c_proj.weight,
-                model, jnp.zeros_like(model.blocks[i].mlp.c_proj.weight))
-            # Gates: small init
-            for attr in ['gate_alpha', 'gate_eta', 'gate_theta']:
-                w = getattr(model.blocks[i].memory, attr).weight
-                model = eqx.tree_at(
-                    lambda m, a=attr, j=i: getattr(m.blocks[j].memory, a).weight,
-                    model, jax.random.normal(keys[ki], w.shape) * 0.01)
-                ki += 1
-            if model.blocks[i].memory.gate_gamma is not None:
-                w = model.blocks[i].memory.gate_gamma.weight
-                model = eqx.tree_at(lambda m, j=i: m.blocks[j].memory.gate_gamma.weight,
-                    model, jax.random.normal(keys[ki], w.shape) * 0.01)
-                ki += 1
-
-        return model
+        # Small lm_head init so initial logits are small
+        init_key = jax.random.split(keys[-2], 2)[0]
+        self.lm_head = eqx.tree_at(
+            lambda m: m.weight, self.lm_head,
+            jax.random.normal(init_key, self.lm_head.weight.shape) * 0.02)
 
     def __call__(self, idx, memory_states=None):
-        """Forward pass.
+        """Forward pass using scan-over-layers.
 
         Args:
             idx: (B, T) integer token indices
@@ -686,25 +716,46 @@ class Atlas(eqx.Module):
             new_memory_states: list of updated memory states
         """
         B, T = idx.shape
+        cfg = self.config
+        H = cfg.n_head
+        D = cfg.n_embd // H
+        E = cfg.memory_expand * D if cfg.deep_memory else D
+        n_layer = cfg.n_layer
 
         # Embed + normalize — direct index into weight matrix
         x = self.wte.weight[idx]  # (B, T, C)
         x = rms_norm(x)
 
-        # Forward through blocks
-        new_states = []
-        for i, block in enumerate(self.blocks):
-            layer_state = memory_states[i] if memory_states is not None else None
-            x, new_state = block(x, layer_state)
-            new_states.append(new_state)
+        # Prepare stacked memory states with leading n_layer dim
+        if memory_states is None:
+            stacked_states = _make_initial_memory_states(
+                n_layer, B, H, D, E, cfg.deep_memory, x.dtype)
+        else:
+            stacked_states = jax.tree.map(lambda *xs: jnp.stack(xs), *memory_states)
+
+        # Scan over layers — XLA compiles a single loop body instead of n_layer copies
+        def scan_fn(x, layer_data):
+            block, mem_state = layer_data
+            mem_out, new_state = block.memory(rms_norm(x), mem_state)
+            x = x + mem_out
+            x = x + block.mlp(rms_norm(x))
+            return x, new_state
+
+        x, new_states_stacked = lax.scan(scan_fn, x, (self.blocks, stacked_states))
 
         x = rms_norm(x)
 
         # Logits with soft capping
         logits = x @ self.lm_head.weight.T  # (B, T, padded_vocab)
-        logits = logits[..., :self.config.vocab_size]
+        logits = logits[..., :cfg.vocab_size]
         logits = logits.astype(jnp.float32)
         softcap = 15.0
         logits = softcap * jnp.tanh(logits / softcap)
+
+        # Convert stacked states back to list for API compatibility
+        new_states = [
+            jax.tree.map(lambda s: s[i], new_states_stacked)
+            for i in range(n_layer)
+        ]
 
         return logits, new_states

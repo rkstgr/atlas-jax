@@ -62,6 +62,20 @@ def rms_norm(x):
     return x * jax.lax.rsqrt(ms + 1e-6)
 
 
+@partial(jax.custom_vjp, nondiff_argnums=(1,))
+def _scale_grad(x, scale):
+    """Identity forward, scaled backward. Tames gradient explosion."""
+    return x
+
+def _scale_grad_fwd(x, scale):
+    return x, ()
+
+def _scale_grad_bwd(scale, _, g):
+    return (g * scale,)
+
+_scale_grad.defvjp(_scale_grad_fwd, _scale_grad_bwd)
+
+
 def _gelu_derivative(x):
     """Exact derivative of GELU(x) = x * Phi(x)."""
     cdf = 0.5 * (1.0 + jax.lax.erf(x * 0.7071067811865476))
@@ -565,13 +579,11 @@ class AtlasMemoryLayer(eqx.Module):
             y = jnp.transpose(all_y, (1, 0, 2, 3, 4)).reshape(B, T, H, D)
 
         # Trim padding and project back to residual stream.
-        # Stop-gradient norm bounds gradient magnitude through the memory layer.
-        # The memory backward has spectral norm ~100× per layer; without this,
-        # gradients overflow at 16+ layers even with tiny c_proj init.
+        # Scale down backward gradient to tame the memory layer's ~100× per-layer
+        # spectral norm. Forward is unaffected (identity). 0.01 reduces the
+        # effective per-layer amplification from ~100× to ~1×.
         y = y[:, :T_orig].reshape(B, T_orig, -1)
-        scale = jax.lax.stop_gradient(
-            jax.lax.rsqrt(jnp.mean(y * y, axis=-1, keepdims=True) + 1e-6))
-        y = y * scale
+        y = _scale_grad(y, 0.01)
         y = (y @ self.c_proj.weight.T).reshape(B, T_orig, C)
 
         return y, final_state

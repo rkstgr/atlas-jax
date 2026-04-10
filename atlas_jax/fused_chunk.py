@@ -345,8 +345,14 @@ def _regular_fwd(W1, W2, SW1, SW2, momW1, momW2, theta, alpha, q,
 
 
 # ---------------------------------------------------------------------------
-# Public API: fused_chunk_scan with custom_vjp
+# Public API: module-level custom_vjp with nondiff_argnums
 # ---------------------------------------------------------------------------
+# Uses nondiff_argnums for ns_steps/pe_ste (static Python ints/bools).
+# This matches the triton_linear_scan pattern which works correctly under
+# eqx.filter_value_and_grad. The previous factory+custom_vmap pattern broke
+# VJP: custom_vmap wrapping custom_vjp from the outside prevented JAX from
+# seeing the custom_vjp rules, causing a CustomVJPException about closed-over
+# values and producing zero gradients (the cause of the training plateau).
 
 @partial(jax.custom_vjp, nondiff_argnums=(9, 10))
 def fused_chunk_scan(W1, W2, SW1, SW2, momW1, momW2, theta, alpha, q,
@@ -366,20 +372,18 @@ def fused_chunk_scan(W1, W2, SW1, SW2, momW1, momW2, theta, alpha, q,
         theta: (B, cs, H) momentum gate
         alpha: (B, cs, H) forget gate
         q:     (B, cs, H, D) query vectors
-        ns_steps: (static) number of PE iterations
-        pe_ste:   (static) use straight-through estimator for PE
+        ns_steps: (static int) number of PE iterations
+        pe_ste:   (static bool) use straight-through estimator for PE
 
     Returns:
         y:     (B, cs, H, D) output
         state: DeepMemoryState with updated W1, W2, S_W1, S_W2
     """
     pe_coeffs = _pe_coeffs_flat(ns_steps)
-    out_dtype = W1.dtype  # match input dtype for vjp compatibility
+    out_dtype = W1.dtype
     y, W1_out, W2_out, SW1_out, SW2_out = _triton_fused_fwd(
         W1, W2, SW1, SW2, momW1, momW2, theta, alpha, q,
         pe_coeffs, ns_steps)
-    # Cast output to input dtype (Triton kernel always outputs bf16,
-    # but vjp requires output dtype to match for gradient flow)
     y = y.astype(out_dtype)
     W1_out = W1_out.astype(out_dtype)
     W2_out = W2_out.astype(out_dtype)
@@ -390,29 +394,23 @@ def fused_chunk_scan(W1, W2, SW1, SW2, momW1, momW2, theta, alpha, q,
 
 def _fused_scan_fwd(W1, W2, SW1, SW2, momW1, momW2, theta, alpha, q,
                      ns_steps, pe_ste):
-    """custom_vjp forward: run fused kernel, save residuals for backward."""
+    """custom_vjp forward: run fused Triton kernel, save inputs as residuals."""
     result = fused_chunk_scan(W1, W2, SW1, SW2, momW1, momW2, theta, alpha, q,
                                ns_steps, pe_ste)
-    # Save inputs as residuals (backward recomputes forward using regular ops)
     residuals = (W1, W2, SW1, SW2, momW1, momW2, theta, alpha, q)
     return result, residuals
 
 
 def _fused_scan_bwd(ns_steps, pe_ste, residuals, grads):
-    """custom_vjp backward: recompute forward with regular ops, then vjp.
+    """custom_vjp backward: recompute with regular JAX ops, then vjp.
 
-    This avoids writing a custom backward Triton kernel. The backward uses:
-    - Existing Triton linear_scan backward (reverse scan, already battle-tested)
-    - PE STE backward (identity, ~free)
-    - JAX autodiff for einsums (standard, correct)
-
-    The cost is one extra forward recomputation, but it's done with regular ops
-    (not through the XLA while-loop), so it's fast.
+    Uses existing triton_linear_scan backward + PE STE backward + JAX
+    autodiff for einsums. One extra forward recomputation, but with fast
+    Triton scan kernels.
     """
     W1, W2, SW1, SW2, momW1, momW2, theta, alpha, q = residuals
     grad_y, grad_state = grads
 
-    # Recompute forward + get backward via jax.vjp
     def fwd_for_vjp(W1, W2, SW1, SW2, momW1, momW2, theta, alpha, q):
         return _regular_fwd(W1, W2, SW1, SW2, momW1, momW2, theta, alpha, q,
                             ns_steps, pe_ste)

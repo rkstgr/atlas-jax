@@ -35,13 +35,18 @@ class MuonState(NamedTuple):
     second_moment: jax.Array   # factored second moment for NorMuon
 
 
+def _mT(x):
+    """Matrix transpose: swap last two dims (works for 2D and batched 3D+)."""
+    return jnp.swapaxes(x, -2, -1)
+
+
 def _muon_leaf_init(param, momentum_val, beta2_val):
-    """Init state for a single 2D parameter."""
+    """Init state for a single parameter (2D or batched 3D for stacked layers)."""
     shape = param.shape
     if shape[-2] >= shape[-1]:
-        sm_shape = (shape[-2], 1)
+        sm_shape = (*shape[:-2], shape[-2], 1)
     else:
-        sm_shape = (1, shape[-1])
+        sm_shape = (*shape[:-2], 1, shape[-1])
     return MuonState(
         momentum=jnp.zeros_like(param),
         second_moment=jnp.zeros(sm_shape, dtype=param.dtype),
@@ -67,12 +72,12 @@ def _muon_leaf_update(grad, state, param, learning_rate, momentum, beta2,
 
     if shape[-2] > shape[-1]:
         for a, b, c in POLAR_EXPRESS_COEFFS[:ns_steps]:
-            A = X.T @ X
+            A = _mT(X) @ X
             B = b * A + c * (A @ A)
             X = a * X + X @ B
     else:
         for a, b, c in POLAR_EXPRESS_COEFFS[:ns_steps]:
-            A = X @ X.T
+            A = X @ _mT(X)
             B = b * A + c * (A @ A)
             X = a * X + B @ X
     g = X.astype(dtype)
@@ -209,7 +214,12 @@ def _label_params(model):
             labels.append('embedding')
         elif 'lm_head' in path_str and 'weight' in path_str:
             labels.append('lm_head')
-        elif hasattr(leaf, 'ndim') and leaf.ndim == 2 and 'blocks' in path_str:
+        elif ('blocks' in path_str and 'weight' in path_str
+              and 'conv' not in path_str
+              and hasattr(leaf, 'ndim') and leaf.ndim >= 2):
+            # Linear weight matrices in blocks → Muon.
+            # With scan-over-layers, these are ndim 3 (n_layer, out, in).
+            # Conv weights excluded ('conv' in path) — they go to scalar.
             labels.append('muon')
         else:
             labels.append('scalar')

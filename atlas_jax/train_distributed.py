@@ -12,9 +12,11 @@ import os
 import sys
 import time
 import math
+import signal
 import argparse
 from functools import partial
 from dataclasses import asdict
+from pathlib import Path
 
 # --- Multi-process setup: MUST happen before any JAX computation ---
 _LOCAL_RANK = int(os.environ.get("SLURM_LOCALID", "0"))   # 0-3 per node
@@ -47,6 +49,63 @@ from atlas_jax.data import data_loader
 from atlas_jax.tokenizer import get_tokenizer
 from atlas_jax.train import estimate_flops_per_token
 from atlas_jax.optim import build_optimizer
+
+
+# ---------------------------------------------------------------------------
+# Checkpointing
+# ---------------------------------------------------------------------------
+
+def _to_cpu(x):
+    """Move array to CPU for serialization."""
+    if eqx.is_array(x):
+        return jax.device_get(x)
+    return x
+
+
+def save_checkpoint(model, opt_state, step, ckpt_dir, rank=0):
+    """Save model + optimizer state to disk. Only rank 0 writes."""
+    if rank != 0:
+        return
+    ckpt_dir = Path(ckpt_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    # Move to CPU for serialization
+    model_cpu = jax.tree.map(_to_cpu, model, is_leaf=eqx.is_array)
+    opt_cpu = jax.tree.map(_to_cpu, opt_state, is_leaf=eqx.is_array)
+
+    tmp_model = ckpt_dir / "model.eqx.tmp"
+    tmp_opt = ckpt_dir / "opt_state.eqx.tmp"
+    tmp_meta = ckpt_dir / "meta.tmp"
+
+    eqx.tree_serialise_leaves(str(tmp_model), model_cpu)
+    eqx.tree_serialise_leaves(str(tmp_opt), opt_cpu)
+    with open(tmp_meta, 'w') as f:
+        f.write(f"{step}\n")
+
+    # Atomic rename
+    tmp_model.rename(ckpt_dir / "model.eqx")
+    tmp_opt.rename(ckpt_dir / "opt_state.eqx")
+    tmp_meta.rename(ckpt_dir / "meta.txt")
+    print(f"[ckpt] Saved step {step} to {ckpt_dir}", flush=True)
+
+
+def load_checkpoint(model, opt_state, ckpt_dir):
+    """Load model + optimizer state from disk. Returns (model, opt_state, step)."""
+    ckpt_dir = Path(ckpt_dir)
+    model_path = ckpt_dir / "model.eqx"
+    opt_path = ckpt_dir / "opt_state.eqx"
+    meta_path = ckpt_dir / "meta.txt"
+
+    if not model_path.exists():
+        return model, opt_state, 0
+
+    model = eqx.tree_deserialise_leaves(str(model_path), model)
+    opt_state = eqx.tree_deserialise_leaves(str(opt_path), opt_state)
+    with open(meta_path) as f:
+        step = int(f.read().strip())
+
+    print(f"[ckpt] Resumed from step {step} at {ckpt_dir}", flush=True)
+    return model, opt_state, step
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +257,10 @@ def main():
     parser.add_argument('--time-budget', type=int, default=0)
     parser.add_argument('--max-tokens', type=float, default=0)
     parser.add_argument('--target-bpb', type=float, default=0)
+    parser.add_argument('--ckpt-dir', type=str, default='',
+                        help='Checkpoint directory. Empty = no checkpointing.')
+    parser.add_argument('--ckpt-every', type=int, default=500,
+                        help='Save checkpoint every N steps')
 
     args = parser.parse_args()
 
@@ -288,6 +351,13 @@ def main():
 
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
+    # Resume from checkpoint if available
+    start_step = 0
+    if args.ckpt_dir:
+        model, opt_state, start_step = load_checkpoint(model, opt_state, args.ckpt_dir)
+        if start_step > 0:
+            log(f"Resumed from checkpoint at step {start_step}")
+
     # Replicate model and opt_state across all devices
     def _replicate(x):
         return jax.device_put(x, replicate_sharding) if eqx.is_array(x) else x
@@ -347,8 +417,21 @@ def main():
     log("-" * 80)
 
     training_start = time.time()
-    step = 0
+    step = start_step
     step_times = []
+
+    # SIGTERM handler for SLURM preemption — save checkpoint before exit
+    _save_requested = [False]
+    def _sigterm_handler(signum, frame):
+        log(f"[ckpt] SIGTERM received at step {step}, saving checkpoint...")
+        _save_requested[0] = True
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
+    # Skip data batches to resume position
+    if start_step > 0:
+        log(f"Skipping {start_step} data batches to resume position...")
+        for _ in range(start_step):
+            next(train_loader)
 
     while True:
         step += 1
@@ -390,7 +473,22 @@ def main():
                 log(f"  >>> TARGET REACHED: val_bpb {val_bpb:.4f} <= {args.target_bpb}")
                 break
 
+        # Periodic checkpoint save
+        if args.ckpt_dir and args.ckpt_every > 0 and step % args.ckpt_every == 0:
+            save_checkpoint(model, opt_state, step, args.ckpt_dir, rank=_GLOBAL_RANK)
+
+        # SIGTERM: save and exit
+        if _save_requested[0]:
+            if args.ckpt_dir:
+                save_checkpoint(model, opt_state, step, args.ckpt_dir, rank=_GLOBAL_RANK)
+            log(f"[ckpt] Exiting after SIGTERM save at step {step}")
+            sys.exit(0)
+
     training_seconds = time.time() - training_start
+
+    # Save final checkpoint
+    if args.ckpt_dir:
+        save_checkpoint(model, opt_state, step, args.ckpt_dir, rank=_GLOBAL_RANK)
 
     # Final eval
     log("-" * 80)

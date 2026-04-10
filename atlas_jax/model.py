@@ -619,24 +619,35 @@ class Block(eqx.Module):
 def _init_block_weights(blocks_list, key):
     """Initialize block weights for stable training.
 
-    Critical: zero output projections so residual blocks start as identity.
+    Output projections use GPT-2 style scaled init (std = 0.02 / sqrt(2*n_layer))
+    so residual blocks start near-identity but gradients still flow.
+    Zero init kills gradient flow through the residual stream because
+    d(loss)/d(internal_weights) passes through c_proj.T = 0.
+
     Small gates so sigmoid ≈ 0.5.
 
     Operates on a list of Blocks (before stacking) and returns the modified list.
     """
     n = len(blocks_list)
-    keys = jax.random.split(key, 4 * n + 1)
+    keys = jax.random.split(key, 4 * n + 10)
     ki = 0
+    # GPT-2 convention: scale output projections by 1/sqrt(2*n_residual_blocks)
+    # Factor of 2 because each block has 2 residual connections (memory + MLP)
+    proj_std = 0.02 / math.sqrt(2 * n)
 
     for i in range(n):
-        # Memory output projection: ZERO (blocks start as identity)
+        # Memory output projection: small scaled init (near-identity blocks)
+        w = blocks_list[i].memory.c_proj.weight
         blocks_list[i] = eqx.tree_at(
             lambda b: b.memory.c_proj.weight, blocks_list[i],
-            jnp.zeros_like(blocks_list[i].memory.c_proj.weight))
-        # MLP output projection: ZERO
+            jax.random.normal(keys[ki], w.shape) * proj_std)
+        ki += 1
+        # MLP output projection: small scaled init
+        w = blocks_list[i].mlp.c_proj.weight
         blocks_list[i] = eqx.tree_at(
             lambda b: b.mlp.c_proj.weight, blocks_list[i],
-            jnp.zeros_like(blocks_list[i].mlp.c_proj.weight))
+            jax.random.normal(keys[ki], w.shape) * proj_std)
+        ki += 1
         # Gates: small init
         for attr in ['gate_alpha', 'gate_eta', 'gate_theta']:
             w = getattr(blocks_list[i].memory, attr).weight

@@ -631,9 +631,11 @@ def _init_block_weights(blocks_list, key):
     n = len(blocks_list)
     keys = jax.random.split(key, 4 * n + 10)
     ki = 0
-    # GPT-2 convention: scale output projections by 1/sqrt(2*n_residual_blocks)
-    # Factor of 2 because each block has 2 residual connections (memory + MLP)
-    proj_std = 0.02 / math.sqrt(2 * n)
+    # Very small output projection init to prevent gradient explosion through
+    # deep layers. The memory layer backward has high spectral norm (~100× per
+    # layer), so even GPT-2 style 0.02/sqrt(2*n) is too large at 21+ layers.
+    # 1e-6 keeps gradients healthy while allowing gradient flow (unlike zero).
+    proj_std = 1e-6
 
     for i in range(n):
         # Memory output projection: small scaled init (near-identity blocks)

@@ -17,19 +17,21 @@ from functools import partial
 from dataclasses import asdict
 
 # --- Multi-process setup: MUST happen before any JAX computation ---
-_LOCAL_RANK = int(os.environ.get("SLURM_LOCALID", "0"))
+_LOCAL_RANK = int(os.environ.get("SLURM_LOCALID", "0"))   # 0-3 per node
+_GLOBAL_RANK = int(os.environ.get("SLURM_PROCID", "0"))   # unique across all nodes
 _WORLD_SIZE = int(os.environ.get("SLURM_NTASKS", "1"))
 _COORDINATOR = os.environ.get("MASTER_ADDR", "localhost")
 
 import jax
 
 # Initialize distributed runtime BEFORE any JAX computation.
-# local_device_ids tells JAX which GPU this process owns (don't use CUDA_VISIBLE_DEVICES).
+# process_id must be globally unique (SLURM_PROCID, not SLURM_LOCALID).
+# local_device_ids tells JAX which GPU on this node this process owns.
 if _WORLD_SIZE > 1:
     jax.distributed.initialize(
         coordinator_address=f"{_COORDINATOR}:29500",
         num_processes=_WORLD_SIZE,
-        process_id=_LOCAL_RANK,
+        process_id=_GLOBAL_RANK,
         local_device_ids=[_LOCAL_RANK],
     )
 
@@ -143,7 +145,7 @@ def make_eval_step(mesh):
 
 def log(msg, rank=0):
     """Print only on rank 0."""
-    if _LOCAL_RANK == rank:
+    if _GLOBAL_RANK == rank:
         print(msg, flush=True)
 
 
@@ -195,7 +197,7 @@ def main():
 
     log(f"JAX {jax.__version__} | global devices: {jax.devices()} | "
         f"local: {jax.local_devices()} | precision: {args.matmul_precision}")
-    log(f"World size: {_WORLD_SIZE} | Rank: {_LOCAL_RANK} | "
+    log(f"World size: {_WORLD_SIZE} | Rank: {_GLOBAL_RANK} | "
         f"Global batch: {args.batch_size} | Per-GPU: {local_batch}")
 
     if args.batch_size % n_devices != 0:
@@ -267,10 +269,10 @@ def main():
     tokenizer = get_tokenizer(args.tokenizer_dir)
     train_loader = data_loader(
         args.data_dir, tokenizer, local_batch, args.seq_len, split='train',
-        rank=_LOCAL_RANK, world_size=_WORLD_SIZE)
+        rank=_GLOBAL_RANK, world_size=_WORLD_SIZE)
     val_loader = data_loader(
         args.data_dir, tokenizer, local_batch, args.seq_len, split='val',
-        rank=_LOCAL_RANK, world_size=_WORLD_SIZE)
+        rank=_GLOBAL_RANK, world_size=_WORLD_SIZE)
 
     tokens_per_step = args.batch_size * args.seq_len  # global
     gpu_peak_flops = args.gpu_peak_tflops * 1e12 * n_devices
@@ -291,10 +293,15 @@ def main():
     log("-" * 80)
 
     def make_global_batch(local_inputs, local_targets):
-        """Each rank produces local_batch; shard_map expects global array
-        sharded along batch dim across the mesh."""
-        return (jax.device_put(local_inputs, data_sharding),
-                jax.device_put(local_targets, data_sharding))
+        """Each rank has (local_batch, T) — assemble into global sharded array."""
+        local_device = jax.local_devices()[0]
+        inp = jax.make_array_from_single_device_arrays(
+            (args.batch_size, args.seq_len), data_sharding,
+            [jax.device_put(local_inputs, local_device)])
+        tgt = jax.make_array_from_single_device_arrays(
+            (args.batch_size, args.seq_len), data_sharding,
+            [jax.device_put(local_targets, local_device)])
+        return inp, tgt
 
     # Warmup compilation
     log("Compiling train step (first step will be slow)...")

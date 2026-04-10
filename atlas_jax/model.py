@@ -244,7 +244,16 @@ class AtlasMemoryLayer(eqx.Module):
         self.deep_memory = config.deep_memory
         self.pe_ste = config.pe_ste
         self.use_checkpoint = config.use_checkpoint
-        self.fused_chunk = config.fused_chunk and _HAS_FUSED_CHUNK
+        D = config.n_embd // config.n_head
+        _d_is_pow2 = (D & (D - 1) == 0)
+        self.fused_chunk = config.fused_chunk and _HAS_FUSED_CHUNK and _d_is_pow2
+        if config.fused_chunk and _HAS_FUSED_CHUNK and not _d_is_pow2:
+            import warnings
+            warnings.warn(
+                f"Fused chunk kernel disabled: D={D} is not a power of 2 "
+                f"(n_embd={config.n_embd}, n_head={config.n_head}). "
+                f"Falling back to regular scan ops."
+            )
 
         C = config.n_embd
         self.c_q = eqx.nn.Linear(C, C, use_bias=False, key=keys[0])

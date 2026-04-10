@@ -218,6 +218,11 @@ def _triton_fused_fwd(W1, W2, SW1, SW2, momW1, momW2, theta, alpha, q,
     """
     B, H_, D, E = W1.shape
     assert D == E, f"Fused kernel requires D==E, got D={D}, E={E}"
+    assert D & (D - 1) == 0, (
+        f"Fused kernel requires D to be a power of 2 (got D={D}). "
+        f"The flat-to-2D reshape assumes stride==BD, which only holds when D==BD. "
+        f"Use --no-fused-chunk or choose n_embd/n_head that gives a power-of-2 D."
+    )
     cs = momW1.shape[1]
     H = H_
     DE = D * E

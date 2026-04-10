@@ -1,9 +1,9 @@
 """Training loop for Atlas-JAX.
 
-Single-GPU training with:
-- eqx.filter_jit for compiled train/eval steps
+Data-parallel training with:
+- pmap for multi-GPU (works with Triton custom kernels)
+- filter_jit for single-GPU
 - eqx.filter_value_and_grad for differentiation
-- Soft logit capping (15.0 * tanh(logits / 15.0))
 - MFU and BPB reporting
 """
 
@@ -47,30 +47,72 @@ def estimate_flops_per_token(config, n_params, n_embed_params):
 # Train / eval steps
 # ---------------------------------------------------------------------------
 
-@eqx.filter_jit(donate='warn')
-def train_step(model, opt_state, optimizer, inputs, targets):
-    def loss_fn(model):
-        logits, _ = model(inputs)
-        logits_flat = logits.reshape(-1, logits.shape[-1])
-        targets_flat = targets.reshape(-1)
-        log_probs = jax.nn.log_softmax(logits_flat, axis=-1)
-        loss = -jnp.mean(log_probs[jnp.arange(targets_flat.shape[0]), targets_flat])
-        return loss
-
-    loss, grads = eqx.filter_value_and_grad(loss_fn)(model)
-    updates, new_opt_state = optimizer.update(grads, opt_state, model)
-    new_model = eqx.apply_updates(model, updates)
-    return new_model, new_opt_state, loss
-
-
-@eqx.filter_jit
-def eval_step(model, inputs, targets):
+def _loss_fn(model, inputs, targets):
+    """Cross-entropy loss (shared by train and eval)."""
     logits, _ = model(inputs)
     logits_flat = logits.reshape(-1, logits.shape[-1])
     targets_flat = targets.reshape(-1)
     log_probs = jax.nn.log_softmax(logits_flat, axis=-1)
-    loss = -jnp.mean(log_probs[jnp.arange(targets_flat.shape[0]), targets_flat])
-    return loss
+    return -jnp.mean(log_probs[jnp.arange(targets_flat.shape[0]), targets_flat])
+
+
+def _upcast_grads(grads):
+    """Cast bf16 gradients to f32 for numerically stable optimizer updates.
+
+    Without this, optax.clip_by_global_norm squares bf16 values, which
+    overflows to inf for any gradient > 256 (since 256^2 > bf16 max).
+    """
+    def _cast(x):
+        if eqx.is_array(x) and x.dtype == jnp.bfloat16:
+            return x.astype(jnp.float32)
+        return x
+    return jax.tree.map(_cast, grads, is_leaf=eqx.is_array)
+
+
+def make_train_step(n_devices):
+    """Create train step — pmap for multi-GPU, filter_jit for single-GPU.
+
+    pmap works with Triton custom kernels because each device runs the
+    full model independently on its B/n_devices shard. Gradients are
+    averaged via pmean (NCCL all-reduce).
+    """
+    if n_devices > 1:
+        @eqx.filter_pmap(axis_name='data', donate='all')
+        def train_step(model, opt_state, optimizer, inputs, targets):
+            loss, grads = eqx.filter_value_and_grad(
+                _loss_fn, has_aux=False)(model, inputs, targets)
+            grads = _upcast_grads(grads)
+            grads = jax.lax.pmean(grads, axis_name='data')
+            loss = jax.lax.pmean(loss, axis_name='data')
+            updates, new_opt_state = optimizer.update(grads, opt_state, model)
+            new_model = eqx.apply_updates(model, updates)
+            return new_model, new_opt_state, loss
+    else:
+        @eqx.filter_jit(donate='all')
+        def train_step(model, opt_state, optimizer, inputs, targets):
+            loss, grads = eqx.filter_value_and_grad(
+                _loss_fn, has_aux=False)(model, inputs, targets)
+            grads = _upcast_grads(grads)
+            updates, new_opt_state = optimizer.update(grads, opt_state, model)
+            new_model = eqx.apply_updates(model, updates)
+            return new_model, new_opt_state, loss
+
+    return train_step
+
+
+def make_eval_step(n_devices):
+    """Create eval step — pmap for multi-GPU, filter_jit for single-GPU."""
+    if n_devices > 1:
+        @eqx.filter_pmap(axis_name='data')
+        def eval_step(model, inputs, targets):
+            loss = _loss_fn(model, inputs, targets)
+            return jax.lax.pmean(loss, axis_name='data')
+    else:
+        @eqx.filter_jit
+        def eval_step(model, inputs, targets):
+            return _loss_fn(model, inputs, targets)
+
+    return eval_step
 
 
 def main():
@@ -119,7 +161,12 @@ def main():
 
     jax.config.update("jax_compilation_cache_dir", "/p/scratch/westai0047/nanochat/jax_cache")
     jax.config.update("jax_default_matmul_precision", args.matmul_precision)
+    n_devices = len(jax.devices())
     print(f"JAX {jax.__version__} | devices: {jax.devices()} | precision: {args.matmul_precision}")
+
+    if n_devices > 1 and args.batch_size % n_devices != 0:
+        raise ValueError(f"batch_size={args.batch_size} must be divisible by n_devices={n_devices}")
+
     key = jax.random.PRNGKey(args.seed)
 
     config = AtlasConfig(
@@ -173,6 +220,16 @@ def main():
     )
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
+    # For multi-GPU: replicate model and opt_state to all devices
+    if n_devices > 1:
+        model = jax.device_put_replicated(model, jax.devices())
+        opt_state = jax.device_put_replicated(opt_state, jax.devices())
+        print(f"Data parallel (pmap): batch {args.batch_size} across {n_devices} GPUs "
+              f"({args.batch_size // n_devices}/GPU)")
+
+    train_step = make_train_step(n_devices)
+    eval_step = make_eval_step(n_devices)
+
     # Data
     tokenizer = get_tokenizer(args.tokenizer_dir)
     train_loader = data_loader(
@@ -181,7 +238,7 @@ def main():
         args.data_dir, tokenizer, args.batch_size, args.seq_len, split='val')
 
     tokens_per_step = args.batch_size * args.seq_len
-    gpu_peak_flops = args.gpu_peak_tflops * 1e12
+    gpu_peak_flops = args.gpu_peak_tflops * 1e12 * n_devices  # total across all GPUs
 
     # Override total_steps if max-tokens is set
     if args.max_tokens > 0:
@@ -199,11 +256,20 @@ def main():
         print(f"Training for {args.total_steps} steps")
     print("-" * 80)
 
+    def shard_batch(x):
+        """Reshape (B, T) → (n_devices, B//n_devices, T) for pmap, or no-op for 1 GPU."""
+        if n_devices > 1:
+            return x.reshape(n_devices, x.shape[0] // n_devices, *x.shape[1:])
+        return x
+
     # Warmup compilation with first batch
     print("Compiling train step (first step will be slow)...")
     t_compile = time.time()
     inputs, targets = next(train_loader)
+    inputs, targets = shard_batch(inputs), shard_batch(targets)
     model, opt_state, loss = train_step(model, opt_state, optimizer, inputs, targets)
+    if n_devices > 1:
+        loss = loss[0]  # all devices have same value after pmean
     float(loss)  # block until done
     compile_time = time.time() - t_compile
     print(f"Compilation done in {compile_time:.1f}s | initial loss: {float(loss):.4f}")
@@ -224,8 +290,9 @@ def main():
 
         t0 = time.time()
         inputs, targets = next(train_loader)
+        inputs, targets = shard_batch(inputs), shard_batch(targets)
         model, opt_state, loss = train_step(model, opt_state, optimizer, inputs, targets)
-        loss_val = float(loss)
+        loss_val = float(loss[0]) if n_devices > 1 else float(loss)
         dt = time.time() - t0
         step_times.append(dt)
 
@@ -241,8 +308,9 @@ def main():
             val_losses = []
             for _ in range(args.eval_steps):
                 val_inputs, val_targets = next(val_loader)
+                val_inputs, val_targets = shard_batch(val_inputs), shard_batch(val_targets)
                 val_loss = eval_step(model, val_inputs, val_targets)
-                val_losses.append(float(val_loss))
+                val_losses.append(float(val_loss[0]) if n_devices > 1 else float(val_loss))
             avg_val_loss = sum(val_losses) / len(val_losses)
             val_bpb = avg_val_loss * BPB_FACTOR
             total_tok = step * tokens_per_step
@@ -259,8 +327,9 @@ def main():
     val_losses = []
     for _ in range(args.eval_steps):
         val_inputs, val_targets = next(val_loader)
+        val_inputs, val_targets = shard_batch(val_inputs), shard_batch(val_targets)
         val_loss = eval_step(model, val_inputs, val_targets)
-        val_losses.append(float(val_loss))
+        val_losses.append(float(val_loss[0]) if n_devices > 1 else float(val_loss))
     avg_val_loss = sum(val_losses) / len(val_losses)
     val_bpb = avg_val_loss * BPB_FACTOR
     total_seconds = time.time() - training_start

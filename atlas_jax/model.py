@@ -62,6 +62,12 @@ def rms_norm(x):
     return x * jax.lax.rsqrt(ms + 1e-6)
 
 
+def _dropout(x, rate, key):
+    """Apply dropout with inverted scaling."""
+    keep = jax.random.bernoulli(key, 1.0 - rate, x.shape)
+    return jnp.where(keep, x / (1.0 - rate), 0.0)
+
+
 @partial(jax.custom_vjp, nondiff_argnums=(1,))
 def _scale_grad(x, scale):
     """Identity forward, scaled backward. Tames gradient explosion."""
@@ -229,6 +235,16 @@ class AtlasMemoryLayer(eqx.Module):
     # Polynomial feature mapping coefficients
     poly_coeffs: jax.Array | None
 
+    # ResidualNorm gamma: LayerNorm(MLP(x)) * (gamma+1) + x (per-head, init=0)
+    ln_gamma: jax.Array  # (H, D)
+
+    # Learnable initial memory weights (Xavier init, like PyTorch)
+    W1_init: jax.Array  # (H, D, E)
+    W2_init: jax.Array  # (H, E, D)
+
+    # Retrieve gate: per-head sigmoid gate on memory output (PyTorch: when heads > 1)
+    retrieve_gate: eqx.nn.Linear | None
+
     # Static config
     n_head: int = eqx.field(static=True)
     head_dim: int = eqx.field(static=True)
@@ -241,12 +257,15 @@ class AtlasMemoryLayer(eqx.Module):
     pe_ste: bool = eqx.field(static=True)
     use_checkpoint: bool = eqx.field(static=True)
     fused_chunk: bool = eqx.field(static=True)
+    max_lr: float = eqx.field(static=True)
+    stop_grad_chunks: bool = eqx.field(static=True)
 
     def __init__(self, config: AtlasConfig, *, key):
-        keys = jax.random.split(key, 12)
+        keys = jax.random.split(key, 14)
         H = config.n_head
-        D = config.n_embd // H
+        D = config.dim_head if config.dim_head is not None else config.n_embd // H
         E = config.memory_expand * D if config.deep_memory else D
+        dim_inner = H * D  # may differ from n_embd when dim_head is set
 
         self.n_head = H
         self.head_dim = D
@@ -258,7 +277,8 @@ class AtlasMemoryLayer(eqx.Module):
         self.deep_memory = config.deep_memory
         self.pe_ste = config.pe_ste
         self.use_checkpoint = config.use_checkpoint
-        D = config.n_embd // config.n_head
+        self.max_lr = config.max_lr
+        self.stop_grad_chunks = config.stop_grad_chunks
         _d_is_pow2 = (D & (D - 1) == 0)
         self.fused_chunk = config.fused_chunk and _HAS_FUSED_CHUNK and _d_is_pow2
         if config.fused_chunk and _HAS_FUSED_CHUNK and not _d_is_pow2:
@@ -270,29 +290,53 @@ class AtlasMemoryLayer(eqx.Module):
             )
 
         C = config.n_embd
-        self.c_q = eqx.nn.Linear(C, C, use_bias=False, key=keys[0])
-        self.c_k = eqx.nn.Linear(C, C, use_bias=False, key=keys[1])
-        self.c_v = eqx.nn.Linear(C, C, use_bias=False, key=keys[2])
-        self.c_proj = eqx.nn.Linear(C, C, use_bias=False, key=keys[3])
+        # Q/K/V project from n_embd to dim_inner (= heads * dim_head)
+        self.c_q = eqx.nn.Linear(C, dim_inner, use_bias=False, key=keys[0])
+        self.c_k = eqx.nn.Linear(C, dim_inner, use_bias=False, key=keys[1])
+        self.c_v = eqx.nn.Linear(C, dim_inner, use_bias=False, key=keys[2])
+        # Output projection: dim_inner back to n_embd
+        self.c_proj = eqx.nn.Linear(dim_inner, C, use_bias=False, key=keys[3])
 
-        self.conv_q = ShortConv(C, config.conv_kernel, key=keys[4])
-        self.conv_k = ShortConv(C, config.conv_kernel, key=keys[5])
-        self.conv_v = ShortConv(C, config.conv_kernel, key=keys[6])
+        self.conv_q = ShortConv(dim_inner, config.conv_kernel, key=keys[4])
+        self.conv_k = ShortConv(dim_inner, config.conv_kernel, key=keys[5])
+        self.conv_v = ShortConv(dim_inner, config.conv_kernel, key=keys[6])
 
-        self.gate_alpha = eqx.nn.Linear(C, H, use_bias=False, key=keys[7])
-        self.gate_eta = eqx.nn.Linear(C, H, use_bias=False, key=keys[8])
-        self.gate_theta = eqx.nn.Linear(C, H, use_bias=False, key=keys[9])
+        self.gate_alpha = eqx.nn.Linear(C, H, use_bias=True, key=keys[7])
+        self.gate_eta = eqx.nn.Linear(C, H, use_bias=True, key=keys[8])
+        self.gate_theta = eqx.nn.Linear(C, H, use_bias=True, key=keys[9])
 
         if self.omega_window > 1:
-            self.gate_gamma = eqx.nn.Linear(C, H, use_bias=False, key=keys[10])
+            self.gate_gamma = eqx.nn.Linear(C, H, use_bias=True, key=keys[10])
         else:
             self.gate_gamma = None
 
         if self.poly_degree > 0:
-            coeffs = jnp.array([1.0 / math.factorial(i) for i in range(1, self.poly_degree + 1)])
+            # All-ones coefficients: phi(x) = x + x^2 + ... + x^p
+            # Matches PyTorch elementwise mode (no 1/i! Taylor scaling)
+            coeffs = jnp.ones(self.poly_degree)
             self.poly_coeffs = coeffs
         else:
             self.poly_coeffs = None
+
+        # ResidualNorm gamma (per head): LayerNorm(MLP(x)) * (gamma+1) + x
+        # Init=0 matches PyTorch (gamma starts at 0, so initially scale=1)
+        # But we also need the outer optimizer to learn gamma, so it stays as zeros
+        self.ln_gamma = jnp.zeros((H, D))
+
+        # Learnable initial memory weights (Xavier uniform, matching PyTorch)
+        # PyTorch clones learned MLP params per batch*head at init. We store
+        # per-head initial weights that get broadcast to (B, H, D, E).
+        k_w1, k_w2 = jax.random.split(keys[11])
+        bound1 = (6.0 / (D + E)) ** 0.5
+        bound2 = (6.0 / (E + D)) ** 0.5
+        self.W1_init = jax.random.uniform(k_w1, (H, D, E), minval=-bound1, maxval=bound1)
+        self.W2_init = jax.random.uniform(k_w2, (H, E, D), minval=-bound2, maxval=bound2)
+
+        # Retrieve gate: per-head sigmoid on memory output (PyTorch has this when heads > 1)
+        if H > 1:
+            self.retrieve_gate = eqx.nn.Linear(C, H, use_bias=False, key=keys[12])
+        else:
+            self.retrieve_gate = None
 
     def _poly_features(self, x):
         """Element-wise polynomial: phi(x) = sum_{i=1}^{p} a_i * x^i."""
@@ -314,7 +358,9 @@ class AtlasMemoryLayer(eqx.Module):
         # Parallel: per-position gradients w.r.t. frozen M
         pred = jnp.einsum('bhvk,bchk->bchv', M, k_c)
         err = pred - v_c
-        u = 2.0 * jnp.einsum('bchv,bchk->bchvk', err, k_c)
+        # 1/D factor matches PyTorch's mean(dim=-1) in MSE loss
+        D = k_c.shape[-1]
+        u = (2.0 / D) * jnp.einsum('bchv,bchk->bchvk', err, k_c)
 
         # Omega rule
         if self.omega_window > 1 and g_c is not None:
@@ -341,7 +387,13 @@ class AtlasMemoryLayer(eqx.Module):
         """Process one chunk with deep MLP memory.
 
         Memory: M(x) = x + W1 @ GELU(W2 @ x) with residual connection.
-        Gradients computed analytically w.r.t. W1 and W2.
+        Gradients computed analytically w.r.t. W1 and W2 with 1/D scaling
+        (matching PyTorch MSE mean(dim=-1)).
+
+        NOTE: PyTorch wraps memory in ResidualNorm(LayerNorm + gamma). Our analytical
+        approach uses plain residual. The ResidualNorm analytical gradients were
+        verified correct but produce worse training dynamics, likely due to
+        interaction with PE orthogonalization. Keeping plain residual for now.
         """
         W1, W2, S_W1, S_W2 = state.W1, state.W2, state.S_W1, state.S_W2
         if _HAS_TRITON_PE:
@@ -356,15 +408,16 @@ class AtlasMemoryLayer(eqx.Module):
             y_pred = k_c + jnp.einsum('bhde,bche->bchd', W1, act) # (B, cs, H, D)
             err = y_pred - v_c                                      # (B, cs, H, D)
 
-        # Gradient w.r.t. W1: 2 * err outer GELU(W2 @ k)
+        # Gradient w.r.t. W1: (2/D) * err outer GELU(W2 @ k)
         with jax.named_scope("mem_grad"):
-            u_W1 = 2.0 * jnp.einsum('bchd,bche->bchde', err, act)  # (B, cs, H, D, E)
-
+            D = k_c.shape[-1]
+            scale = 2.0 / D
+            u_W1 = scale * jnp.einsum('bchd,bche->bchde', err, act)  # (B, cs, H, D, E)
             # Gradient w.r.t. W2: chain through GELU' and W1^T
             gelu_prime = _gelu_derivative(h)                          # (B, cs, H, E)
             w1t_err = jnp.einsum('bhde,bchd->bche', W1, err)         # (B, cs, H, E)
             chain = w1t_err * gelu_prime                               # (B, cs, H, E)
-            u_W2 = 2.0 * jnp.einsum('bche,bchd->bched', chain, k_c)  # (B, cs, H, E, D)
+            u_W2 = scale * jnp.einsum('bche,bchd->bched', chain, k_c)  # (B, cs, H, E, D)
 
         # Omega rule
         with jax.named_scope("omega"):
@@ -459,39 +512,51 @@ class AtlasMemoryLayer(eqx.Module):
         H, D = self.n_head, self.head_dim
         E = self.expand_dim
         cs = self.chunk_size
+        dim_inner = H * D  # may differ from C when dim_head is set
 
         # Project (direct matmul, no vmap overhead) + short causal conv + multi-head reshape
         with jax.named_scope("qkv_proj"):
-            q = self.conv_q((x @ self.c_q.weight.T).reshape(B, T, C)).reshape(B, T, H, D)
-            k = self.conv_k((x @ self.c_k.weight.T).reshape(B, T, C)).reshape(B, T, H, D)
-            v = self.conv_v((x @ self.c_v.weight.T).reshape(B, T, C)).reshape(B, T, H, D)
+            q = self.conv_q((x @ self.c_q.weight.T).reshape(B, T, dim_inner)).reshape(B, T, H, D)
+            k = self.conv_k((x @ self.c_k.weight.T).reshape(B, T, dim_inner)).reshape(B, T, H, D)
+            v = self.conv_v((x @ self.c_v.weight.T).reshape(B, T, dim_inner)).reshape(B, T, H, D)
 
-        # Normalize Q, K for stable memory operations
+        # Polynomial features + RMS norm
+        # PyTorch order: queries = norm(q) then poly(q), keys = poly(k) then norm(k)
         with jax.named_scope("qk_norm_poly"):
-            q, k = rms_norm(q), rms_norm(k)
-
-            # Polynomial feature mapping
             if self.poly_degree > 0:
+                q = rms_norm(q)
                 q = self._poly_features(q)
                 k = self._poly_features(k)
+                k = rms_norm(k)
+            else:
+                q, k = rms_norm(q), rms_norm(k)
 
-        # Input-dependent gates via sigmoid (direct matmul)
+        # Input-dependent gates via sigmoid (direct matmul + bias)
+        # Paper: bias initialized at -2, so sigmoid(-2) ≈ 0.12 initially
         with jax.named_scope("gates"):
-            alpha = jax.nn.sigmoid((x @ self.gate_alpha.weight.T).reshape(B, T, H, 1))
-            eta = jax.nn.sigmoid((x @ self.gate_eta.weight.T).reshape(B, T, H, 1))
-            theta = jax.nn.sigmoid((x @ self.gate_theta.weight.T).reshape(B, T, H, 1))
+            def _gate(layer, x):
+                out = x @ layer.weight.T  # (B, T, H)
+                if layer.bias is not None:
+                    out = out + layer.bias
+                return jax.nn.sigmoid(out.reshape(B, T, H, 1))
+
+            alpha = _gate(self.gate_alpha, x)
+            eta = _gate(self.gate_eta, x) * self.max_lr  # PyTorch: sigmoid * max_lr (default 0.1)
+            theta = _gate(self.gate_theta, x)
 
             gamma = None
             if self.omega_window > 1 and self.gate_gamma is not None:
-                gamma = jax.nn.sigmoid((x @ self.gate_gamma.weight.T).reshape(B, T, H, 1))
+                gamma = _gate(self.gate_gamma, x)
 
         # Initialize memory state if needed
         if memory_state is None:
             if self.deep_memory:
-                W1 = jnp.zeros((B, H, D, E), dtype=x.dtype)
-                W2 = jnp.zeros((B, H, E, D), dtype=x.dtype)
-                eye = jnp.eye(min(E, D), dtype=x.dtype)
-                W2 = W2.at[:, :, :min(E, D), :min(E, D)].set(eye)
+                # Clone learned initial weights per batch (matching PyTorch's
+                # repeat of memory_model_parameter_dict per batch*head)
+                W1 = jnp.broadcast_to(
+                    self.W1_init[jnp.newaxis].astype(x.dtype), (B, H, D, E))
+                W2 = jnp.broadcast_to(
+                    self.W2_init[jnp.newaxis].astype(x.dtype), (B, H, E, D))
                 S_W1 = jnp.zeros((B, H, D, E), dtype=x.dtype)
                 S_W2 = jnp.zeros((B, H, E, D), dtype=x.dtype)
                 memory_state = DeepMemoryState(W1=W1, W2=W2, S_W1=S_W1, S_W2=S_W2)
@@ -518,7 +583,10 @@ class AtlasMemoryLayer(eqx.Module):
         n_chunks = T // cs
 
         def chunk_body(carry, chunk_data):
-            mem_state = jax.lax.stop_gradient(carry)
+            # NOTE: PyTorch uses full gradient flow across chunks via associative scan.
+            # Paper specifies stop_gradient (frozen boundary).
+            # stop_grad_chunks=True -> paper mode, False -> PyTorch mode.
+            mem_state = jax.lax.stop_gradient(carry) if self.stop_grad_chunks else carry
             q_c, k_c, v_c, a_c, e_c, t_c, g_c = chunk_data
             if self.deep_memory:
                 y_c, new_state = self._process_chunk_deep(
@@ -578,12 +646,16 @@ class AtlasMemoryLayer(eqx.Module):
             # (n_chunks, B, cs, H, D) — needs transpose
             y = jnp.transpose(all_y, (1, 0, 2, 3, 4)).reshape(B, T, H, D)
 
-        # Trim padding and project back to residual stream.
-        # Scale down backward gradient to tame the memory layer's ~100× per-layer
-        # spectral norm. Forward is unaffected (identity). 0.01 reduces the
-        # effective per-layer amplification from ~100× to ~1×.
-        y = y[:, :T_orig].reshape(B, T_orig, -1)
-        y = _scale_grad(y, 0.01)
+        # Trim padding
+        y = y[:, :T_orig]  # (B, T_orig, H, D)
+
+        # Retrieve gate: per-head sigmoid gating (PyTorch: when heads > 1)
+        if self.retrieve_gate is not None:
+            gate = jax.nn.sigmoid(x @ self.retrieve_gate.weight.T)  # (B, T_orig, H)
+            y = y * gate[..., jnp.newaxis]  # (B, T_orig, H, D) * (B, T_orig, H, 1)
+
+        # Project back to residual stream
+        y = y.reshape(B, T_orig, -1)
         y = (y @ self.c_proj.weight.T).reshape(B, T_orig, C)
 
         return y, final_state
@@ -594,20 +666,33 @@ class AtlasMemoryLayer(eqx.Module):
 # ---------------------------------------------------------------------------
 
 class MLP(eqx.Module):
+    """Feedforward MLP. Supports GEGLU (SiLU-gated, PyTorch default) or plain GELU."""
     c_fc: eqx.nn.Linear
     c_proj: eqx.nn.Linear
+    geglu: bool = eqx.field(static=True)
 
     def __init__(self, config: AtlasConfig, *, key):
         k1, k2 = jax.random.split(key)
-        self.c_fc = eqx.nn.Linear(config.n_embd, 4 * config.n_embd, use_bias=False, key=k1)
-        self.c_proj = eqx.nn.Linear(4 * config.n_embd, config.n_embd, use_bias=False, key=k2)
+        self.geglu = config.geglu_ff
+        if self.geglu:
+            # GEGLU: dim_inner = dim * 4 * 2/3, project to 2*dim_inner for gate split
+            dim_inner = int(config.n_embd * 4 * 2 / 3)
+            self.c_fc = eqx.nn.Linear(config.n_embd, dim_inner * 2, use_bias=False, key=k1)
+            self.c_proj = eqx.nn.Linear(dim_inner, config.n_embd, use_bias=False, key=k2)
+        else:
+            self.c_fc = eqx.nn.Linear(config.n_embd, 4 * config.n_embd, use_bias=False, key=k1)
+            self.c_proj = eqx.nn.Linear(4 * config.n_embd, config.n_embd, use_bias=False, key=k2)
 
     def __call__(self, x):
         """x: (B, T, C) -> (B, T, C)"""
-        x = x @ self.c_fc.weight.T
-        x = jax.nn.gelu(x)
-        x = x @ self.c_proj.weight.T
-        return x
+        h = x @ self.c_fc.weight.T
+        if self.geglu:
+            # SiLU-gated: split into value and gate, apply silu(gate) * value
+            v, gate = jnp.split(h, 2, axis=-1)
+            h = jax.nn.silu(gate) * v
+        else:
+            h = jax.nn.gelu(h)
+        return h @ self.c_proj.weight.T
 
 
 # ---------------------------------------------------------------------------
@@ -617,16 +702,24 @@ class MLP(eqx.Module):
 class Block(eqx.Module):
     memory: AtlasMemoryLayer
     mlp: MLP
+    dropout_rate: float = eqx.field(static=True)
 
     def __init__(self, config: AtlasConfig, *, key):
         k1, k2 = jax.random.split(key)
         self.memory = AtlasMemoryLayer(config, key=k1)
         self.mlp = MLP(config, key=k2)
+        self.dropout_rate = config.dropout
 
-    def __call__(self, x, memory_state=None):
+    def __call__(self, x, memory_state=None, *, dropout_key=None):
         mem_out, new_state = self.memory(rms_norm(x), memory_state)
+        if dropout_key is not None and self.dropout_rate > 0:
+            k1, k2 = jax.random.split(dropout_key)
+            mem_out = _dropout(mem_out, self.dropout_rate, k1)
         x = x + mem_out
-        x = x + self.mlp(rms_norm(x))
+        mlp_out = self.mlp(rms_norm(x))
+        if dropout_key is not None and self.dropout_rate > 0:
+            mlp_out = _dropout(mlp_out, self.dropout_rate, k2)
+        x = x + mlp_out
         return x, new_state
 
 
@@ -634,53 +727,63 @@ class Block(eqx.Module):
 # Weight initialization + memory state helpers
 # ---------------------------------------------------------------------------
 
-def _init_block_weights(blocks_list, key):
-    """Initialize block weights for stable training.
+def _init_block_weights(blocks_list, key, config=None):
+    """Initialize block weights per paper specifications.
 
-    Output projections use GPT-2 style scaled init (std = 0.02 / sqrt(2*n_layer))
-    so residual blocks start near-identity but gradients still flow.
-    Zero init kills gradient flow through the residual stream because
-    d(loss)/d(internal_weights) passes through c_proj.T = 0.
-
-    Small gates so sigmoid ≈ 0.5.
+    - Output projections: GPT-2 style scaled init (std = 0.02 / sqrt(2*n_layer))
+    - Gate weights: zeros, gate biases: -2.0 (so sigmoid ≈ 0.12 initially)
+    - Q/K/V projections: Xavier uniform
 
     Operates on a list of Blocks (before stacking) and returns the modified list.
     """
     n = len(blocks_list)
-    keys = jax.random.split(key, 4 * n + 10)
+    keys = jax.random.split(key, 6 * n + 10)
     ki = 0
-    # Very small output projection init to prevent gradient explosion through
-    # deep layers. The memory layer backward has high spectral norm (~100× per
-    # layer), so even GPT-2 style 0.02/sqrt(2*n) is too large at 21+ layers.
-    # 1e-6 keeps gradients healthy while allowing gradient flow (unlike zero).
-    proj_std = 1e-6
+    # GPT-2 style scaled init for output projections
+    proj_std = 0.02 / math.sqrt(2 * n)
+    gate_bias_init = config.gate_bias_init if config is not None else -2.0
 
     for i in range(n):
-        # Memory output projection: small scaled init (near-identity blocks)
+        # Memory output projection: scaled init (near-identity residual blocks)
         w = blocks_list[i].memory.c_proj.weight
         blocks_list[i] = eqx.tree_at(
             lambda b: b.memory.c_proj.weight, blocks_list[i],
             jax.random.normal(keys[ki], w.shape) * proj_std)
         ki += 1
-        # MLP output projection: small scaled init
+        # MLP output projection: scaled init
         w = blocks_list[i].mlp.c_proj.weight
         blocks_list[i] = eqx.tree_at(
             lambda b: b.mlp.c_proj.weight, blocks_list[i],
             jax.random.normal(keys[ki], w.shape) * proj_std)
         ki += 1
-        # Gates: small init
-        for attr in ['gate_alpha', 'gate_eta', 'gate_theta']:
+
+        # Q/K/V projections: Xavier uniform (std = 1/sqrt(fan_in))
+        C = blocks_list[i].memory.c_q.weight.shape[1]
+        xavier_std = 1.0 / math.sqrt(C)
+        for attr in ['c_q', 'c_k', 'c_v']:
             w = getattr(blocks_list[i].memory, attr).weight
             blocks_list[i] = eqx.tree_at(
                 lambda b, a=attr: getattr(b.memory, a).weight, blocks_list[i],
-                jax.random.normal(keys[ki], w.shape) * 0.01)
+                jax.random.uniform(keys[ki], w.shape, minval=-xavier_std, maxval=xavier_std))
             ki += 1
+
+        # Gates: zero weight + bias at gate_bias_init (paper: -2, sigmoid(-2) ≈ 0.12)
+        for attr in ['gate_alpha', 'gate_eta', 'gate_theta']:
+            gate = getattr(blocks_list[i].memory, attr)
+            blocks_list[i] = eqx.tree_at(
+                lambda b, a=attr: getattr(b.memory, a).weight, blocks_list[i],
+                jnp.zeros_like(gate.weight))
+            blocks_list[i] = eqx.tree_at(
+                lambda b, a=attr: getattr(b.memory, a).bias, blocks_list[i],
+                jnp.full_like(gate.bias, gate_bias_init))
         if blocks_list[i].memory.gate_gamma is not None:
-            w = blocks_list[i].memory.gate_gamma.weight
+            gate = blocks_list[i].memory.gate_gamma
             blocks_list[i] = eqx.tree_at(
                 lambda b: b.memory.gate_gamma.weight, blocks_list[i],
-                jax.random.normal(keys[ki], w.shape) * 0.01)
-            ki += 1
+                jnp.zeros_like(gate.weight))
+            blocks_list[i] = eqx.tree_at(
+                lambda b: b.memory.gate_gamma.bias, blocks_list[i],
+                jnp.full_like(gate.bias, gate_bias_init))
 
     return blocks_list
 
@@ -709,6 +812,7 @@ class Atlas(eqx.Module):
     wte: eqx.nn.Embedding
     blocks: Block  # Stacked: each array leaf has leading n_layer dim (for lax.scan)
     lm_head: eqx.nn.Linear
+    persist_mem: jax.Array | None  # (num_persist_mem_tokens, n_embd)
     config: AtlasConfig = eqx.field(static=True)
     padded_vocab_size: int = eqx.field(static=True)
 
@@ -721,12 +825,20 @@ class Atlas(eqx.Module):
 
         self.wte = eqx.nn.Embedding(padded_vocab_size, config.n_embd, key=keys[0])
 
+        # Persistent memory tokens (learnable prefix, PyTorch default = 4)
+        if config.num_persist_mem_tokens > 0:
+            pm_key = jax.random.split(keys[0])[0]
+            self.persist_mem = jax.random.normal(
+                pm_key, (config.num_persist_mem_tokens, config.n_embd)) * 0.02
+        else:
+            self.persist_mem = None
+
         # Create blocks as list, apply weight init, then stack for scan-over-layers.
         # Stacking reduces the XLA graph from O(n_layer) unrolled blocks to a single
         # loop body, cutting compilation time from ~30min to ~2min for 21 layers.
         # Muon optimizer handles 3D stacked weights via batched matmul + _mT.
         blocks_list = [Block(config, key=keys[i + 1]) for i in range(config.n_layer)]
-        blocks_list = _init_block_weights(blocks_list, keys[-2])
+        blocks_list = _init_block_weights(blocks_list, keys[-2], config=config)
         self.blocks = jax.tree.map(lambda *xs: jnp.stack(xs), *blocks_list)
 
         self.lm_head = eqx.nn.Linear(config.n_embd, padded_vocab_size, use_bias=False, key=keys[-1])
@@ -736,12 +848,13 @@ class Atlas(eqx.Module):
             lambda m: m.weight, self.lm_head,
             jax.random.normal(init_key, self.lm_head.weight.shape) * 0.02)
 
-    def __call__(self, idx, memory_states=None):
+    def __call__(self, idx, memory_states=None, *, dropout_key=None):
         """Forward pass using scan-over-layers.
 
         Args:
             idx: (B, T) integer token indices
             memory_states: optional list of per-layer memory states for inference
+            dropout_key: PRNG key for dropout (None = no dropout, e.g. eval)
 
         Returns:
             logits: (B, T, vocab_size) with soft capping
@@ -750,13 +863,20 @@ class Atlas(eqx.Module):
         B, T = idx.shape
         cfg = self.config
         H = cfg.n_head
-        D = cfg.n_embd // H
+        D = cfg.dim_head if cfg.dim_head is not None else cfg.n_embd // H
         E = cfg.memory_expand * D if cfg.deep_memory else D
         n_layer = cfg.n_layer
+        drop_rate = cfg.dropout
 
-        # Embed + normalize — direct index into weight matrix
+        # Embed — direct index into weight matrix (no post-embed norm, matching PyTorch)
         x = self.wte.weight[idx]  # (B, T, C)
-        x = rms_norm(x)
+
+        # Prepend persistent memory tokens (learnable prefix)
+        n_persist = cfg.num_persist_mem_tokens
+        if self.persist_mem is not None and n_persist > 0:
+            pm = jnp.broadcast_to(
+                self.persist_mem[jnp.newaxis], (B, n_persist, cfg.n_embd))
+            x = jnp.concatenate([pm, x], axis=1)  # (B, T + n_persist, C)
 
         # Prepare stacked memory states with leading n_layer dim
         if memory_states is None:
@@ -765,24 +885,50 @@ class Atlas(eqx.Module):
         else:
             stacked_states = jax.tree.map(lambda *xs: jnp.stack(xs), *memory_states)
 
+        # Pre-split dropout keys for all layers (stacked for scan)
+        if dropout_key is not None and drop_rate > 0:
+            drop_keys = jax.random.split(dropout_key, n_layer)
+        else:
+            drop_keys = None
+
         # Scan over layers — XLA compiles a single loop body instead of n_layer copies
+        use_dropout = dropout_key is not None and drop_rate > 0
+
         def scan_fn(x, layer_data):
-            block, mem_state = layer_data
+            if use_dropout:
+                block, mem_state, dk = layer_data
+                k1, k2 = jax.random.split(dk)
+            else:
+                block, mem_state = layer_data
             mem_out, new_state = block.memory(rms_norm(x), mem_state)
+            if use_dropout:
+                mem_out = _dropout(mem_out, drop_rate, k1)
             x = x + mem_out
-            x = x + block.mlp(rms_norm(x))
+            mlp_out = block.mlp(rms_norm(x))
+            if use_dropout:
+                mlp_out = _dropout(mlp_out, drop_rate, k2)
+            x = x + mlp_out
             return x, new_state
 
-        x, new_states_stacked = lax.scan(scan_fn, x, (self.blocks, stacked_states))
+        if use_dropout:
+            scan_data = (self.blocks, stacked_states, drop_keys)
+        else:
+            scan_data = (self.blocks, stacked_states)
+        x, new_states_stacked = lax.scan(scan_fn, x, scan_data)
 
         x = rms_norm(x)
 
-        # Logits with soft capping
+        # Strip persistent memory tokens before logits
+        if self.persist_mem is not None and n_persist > 0:
+            x = x[:, n_persist:]  # (B, T, C) — remove prefix
+
+        # Logits
         logits = x @ self.lm_head.weight.T  # (B, T, padded_vocab)
         logits = logits[..., :cfg.vocab_size]
         logits = logits.astype(jnp.float32)
-        softcap = 15.0
-        logits = softcap * jnp.tanh(logits / softcap)
+        if cfg.logit_softcap > 0:
+            softcap = cfg.logit_softcap
+            logits = softcap * jnp.tanh(logits / softcap)
 
         # Convert stacked states back to list for API compatibility
         new_states = [

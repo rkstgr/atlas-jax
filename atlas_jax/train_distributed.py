@@ -112,8 +112,8 @@ def load_checkpoint(model, opt_state, ckpt_dir):
 # Train / eval steps (multi-process via shard_map)
 # ---------------------------------------------------------------------------
 
-def _loss_fn(model, inputs, targets):
-    logits, _ = model(inputs)
+def _loss_fn(model, inputs, targets, dropout_key=None):
+    logits, _ = model(inputs, dropout_key=dropout_key)
     logits_flat = logits.reshape(-1, logits.shape[-1])
     targets_flat = targets.reshape(-1)
     log_probs = jax.nn.log_softmax(logits_flat, axis=-1)
@@ -138,9 +138,10 @@ def make_train_step(mesh, optimizer, model, opt_state):
     n_devices = len(mesh.devices)
 
     if n_devices > 1:
-        def _train_body(model, opt_state, inputs, targets):
+        def _train_body(model, opt_state, inputs, targets, dropout_key):
             loss, grads = eqx.filter_value_and_grad(
-                _loss_fn, has_aux=False)(model, inputs, targets)
+                lambda m, i, t, dk: _loss_fn(m, i, t, dropout_key=dk),
+                has_aux=False)(model, inputs, targets, dropout_key)
             grads = _upcast_grads(grads)
             grads = jax.lax.pmean(grads, axis_name='data')
             loss = jax.lax.pmean(loss, axis_name='data')
@@ -152,21 +153,22 @@ def make_train_step(mesh, optimizer, model, opt_state):
         opt_spec = jax.tree.map(lambda _: P(), eqx.filter(opt_state, eqx.is_array))
 
         @eqx.filter_jit(donate='all')
-        def train_step(model, opt_state, inputs, targets):
+        def train_step(model, opt_state, inputs, targets, dropout_key):
             return shard_map(
                 _train_body,
                 mesh=mesh,
-                in_specs=(model_spec, opt_spec, P('data'), P('data')),
+                in_specs=(model_spec, opt_spec, P('data'), P('data'), P()),
                 out_specs=(model_spec, opt_spec, P()),
                 check_rep=False,
-            )(model, opt_state, inputs, targets)
+            )(model, opt_state, inputs, targets, dropout_key)
 
         return train_step
     else:
         @eqx.filter_jit(donate='all')
-        def train_step(model, opt_state, inputs, targets):
+        def train_step(model, opt_state, inputs, targets, dropout_key):
             loss, grads = eqx.filter_value_and_grad(
-                _loss_fn, has_aux=False)(model, inputs, targets)
+                lambda m, i, t, dk: _loss_fn(m, i, t, dropout_key=dk),
+                has_aux=False)(model, inputs, targets, dropout_key)
             grads = _upcast_grads(grads)
             updates, new_opt_state = optimizer.update(grads, opt_state, model)
             new_model = eqx.apply_updates(model, updates)
@@ -226,6 +228,8 @@ def main():
     parser.add_argument('--ns-steps', type=int, default=3)
     parser.add_argument('--no-checkpoint', action='store_true', default=False)
     parser.add_argument('--fused-chunk', action='store_true', default=False)
+    parser.add_argument('--dropout', type=float, default=0.1)
+    parser.add_argument('--gate-bias-init', type=float, default=-2.0)
 
     parser.add_argument('--batch-size', type=int, default=32,
                         help='GLOBAL batch size (split across all GPUs)')
@@ -299,6 +303,8 @@ def main():
         pe_ste=args.pe_ste,
         use_checkpoint=not args.no_checkpoint,
         fused_chunk=args.fused_chunk,
+        dropout=args.dropout,
+        gate_bias_init=args.gate_bias_init,
     )
     log(f"Config: {asdict(config)}")
 
@@ -405,12 +411,16 @@ def main():
             [jax.device_put(local_targets, local_device)])
         return inp, tgt
 
+    # Dropout PRNG key (split per step for unique masks)
+    dropout_key = jax.random.PRNGKey(args.seed + 1000)
+
     # Warmup compilation
     log("Compiling train step (first step will be slow)...")
     t_compile = time.time()
     inputs, targets = next(train_loader)
     inputs, targets = make_global_batch(inputs, targets)
-    model, opt_state, loss = train_step(model, opt_state, inputs, targets)
+    dropout_key, dk = jax.random.split(dropout_key)
+    model, opt_state, loss = train_step(model, opt_state, inputs, targets, dk)
     float(loss)
     compile_time = time.time() - t_compile
     log(f"Compilation done in {compile_time:.1f}s | initial loss: {float(loss):.4f}")
@@ -445,7 +455,8 @@ def main():
         t0 = time.time()
         inputs, targets = next(train_loader)
         inputs, targets = make_global_batch(inputs, targets)
-        model, opt_state, loss = train_step(model, opt_state, inputs, targets)
+        dropout_key, dk = jax.random.split(dropout_key)
+        model, opt_state, loss = train_step(model, opt_state, inputs, targets, dk)
         loss_val = float(loss)
         dt = time.time() - t0
         step_times.append(dt)

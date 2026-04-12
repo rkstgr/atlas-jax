@@ -230,6 +230,10 @@ def main():
     parser.add_argument('--fused-chunk', action='store_true', default=False)
     parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--gate-bias-init', type=float, default=-2.0)
+    parser.add_argument('--model', type=str, default='lmm', choices=['lmm', 'mag'])
+    parser.add_argument('--window-size', type=int, default=64)
+    parser.add_argument('--memory-layers', type=str, default=None,
+                        help='Comma-separated layer indices for memory (MAG only)')
 
     parser.add_argument('--batch-size', type=int, default=32,
                         help='GLOBAL batch size (split across all GPUs)')
@@ -305,11 +309,17 @@ def main():
         fused_chunk=args.fused_chunk,
         dropout=args.dropout,
         gate_bias_init=args.gate_bias_init,
+        window_size=args.window_size,
+        neural_memory_layers=tuple(int(x) for x in args.memory_layers.split(',')) if args.memory_layers else None,
     )
     log(f"Config: {asdict(config)}")
 
     key, model_key = jax.random.split(key)
-    model = Atlas(config, key=model_key)
+    if args.model == 'mag':
+        from atlas_jax.mag_transformer import MAGTransformer
+        model = MAGTransformer(config, key=model_key)
+    else:
+        model = Atlas(config, key=model_key)
     n_params = sum(x.size for x in jax.tree.leaves(eqx.filter(model, eqx.is_array)))
     n_embed_params = model.wte.weight.size
     flops_per_token = estimate_flops_per_token(config, n_params, n_embed_params)

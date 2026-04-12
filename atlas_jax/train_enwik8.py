@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import equinox as eqx
 import optax
 
-jax.config.update("jax_default_matmul_precision", "float32")
+# Precision set after arg parse (--bf16 uses 'high', default uses 'float32')
 
 from atlas_jax.config import AtlasConfig
 from atlas_jax.model import Atlas
@@ -43,7 +43,13 @@ def main():
     parser.add_argument('--data-path', type=str, default='data/enwik8.gz')
     parser.add_argument('--stop-grad-chunks', action='store_true', default=False,
                         help='Use stop_gradient at chunk boundaries (paper mode)')
+    parser.add_argument('--bf16', action='store_true', default=False,
+                        help='Mixed precision: bf16 model weights, f32 optimizer')
+    parser.add_argument('--fused-chunk', action='store_true', default=False,
+                        help='Use fused Triton kernel')
     args = parser.parse_args()
+
+    jax.config.update("jax_default_matmul_precision", "high" if args.bf16 else "float32")
 
     key = jax.random.PRNGKey(args.seed)
 
@@ -62,7 +68,7 @@ def main():
         memory_expand=args.memory_expand,
         pe_ste=True,
         use_checkpoint=True,
-        fused_chunk=False,
+        fused_chunk=args.fused_chunk,
         dropout=0.0,
         gate_bias_init=0.0,
         max_lr=0.1,
@@ -74,6 +80,12 @@ def main():
 
     key, model_key = jax.random.split(key)
     model = Atlas(config, key=model_key, pad_vocab_size_to=1)  # no padding for byte-level
+
+    if args.bf16:
+        model = jax.tree.map(
+            lambda x: x.astype(jnp.bfloat16) if eqx.is_array(x) and x.dtype == jnp.float32 else x,
+            model, is_leaf=eqx.is_array)
+
     n_params = sum(x.size for x in jax.tree.leaves(eqx.filter(model, eqx.is_array)))
     print(f"Parameters: {n_params:,} ({n_params/1e6:.1f}M)")
     print(f"Config: dim={args.dim}, depth={args.depth}, heads={args.heads}, "
@@ -102,15 +114,22 @@ def main():
     @eqx.filter_jit
     def compute_loss(model, inputs, targets):
         logits, _ = model(inputs)
-        logits_flat = logits.reshape(-1, logits.shape[-1])
+        logits_flat = logits.reshape(-1, logits.shape[-1]).astype(jnp.float32)
         targets_flat = targets.reshape(-1)
         return -jnp.mean(jax.nn.log_softmax(logits_flat, axis=-1)[
             jnp.arange(targets_flat.shape[0]), targets_flat])
+
+    def _upcast_grads(grads):
+        """Cast bf16 gradients to f32 for stable optimizer (clip_grad_norm overflows bf16)."""
+        return jax.tree.map(
+            lambda x: x.astype(jnp.float32) if eqx.is_array(x) and x.dtype == jnp.bfloat16 else x,
+            grads, is_leaf=eqx.is_array)
 
     @eqx.filter_jit
     def train_step(model, opt_state, inputs, targets):
         loss, grads = eqx.filter_value_and_grad(
             lambda m: compute_loss(m, inputs, targets))(model)
+        grads = _upcast_grads(grads)
         updates, new_opt_state = optimizer.update(
             eqx.filter(grads, eqx.is_array), opt_state,
             eqx.filter(model, eqx.is_array))

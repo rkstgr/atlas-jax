@@ -57,9 +57,11 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 def rms_norm(x):
-    """RMS normalization over the last axis."""
+    """RMS normalization over the last axis. Computed in f32 for bf16 stability."""
+    dtype = x.dtype
+    x = x.astype(jnp.float32)
     ms = jnp.mean(x * x, axis=-1, keepdims=True)
-    return x * jax.lax.rsqrt(ms + 1e-6)
+    return (x * jax.lax.rsqrt(ms + 1e-6)).astype(dtype)
 
 
 def _dropout(x, rate, key):
@@ -83,10 +85,11 @@ _scale_grad.defvjp(_scale_grad_fwd, _scale_grad_bwd)
 
 
 def _gelu_derivative(x):
-    """Exact derivative of GELU(x) = x * Phi(x)."""
+    """Exact derivative of GELU(x) = x * Phi(x). Computed in f32."""
+    x = x.astype(jnp.float32)
     cdf = 0.5 * (1.0 + jax.lax.erf(x * 0.7071067811865476))
     pdf = jnp.exp(-0.5 * x * x) * 0.3989422804014327
-    return cdf + x * pdf
+    return cdf + x * pdf  # stays f32 — used in gradient chain
 
 
 def _omega_aggregate(u, gamma, omega_window):
@@ -355,12 +358,14 @@ class AtlasMemoryLayer(eqx.Module):
         """
         _pe = polar_express_ste if self.pe_ste else polar_express
 
-        # Parallel: per-position gradients w.r.t. frozen M
+        # Parallel: per-position gradients w.r.t. frozen M (f32 for bf16 stability)
         pred = jnp.einsum('bhvk,bchk->bchv', M, k_c)
         err = pred - v_c
-        # 1/D factor matches PyTorch's mean(dim=-1) in MSE loss
         D = k_c.shape[-1]
-        u = (2.0 / D) * jnp.einsum('bchv,bchk->bchvk', err, k_c)
+        orig_dtype = err.dtype
+        err_f = err.astype(jnp.float32)
+        k_f = k_c.astype(jnp.float32)
+        u = ((2.0 / D) * jnp.einsum('bchv,bchk->bchvk', err_f, k_f)).astype(orig_dtype)
 
         # Omega rule
         if self.omega_window > 1 and g_c is not None:
@@ -408,16 +413,19 @@ class AtlasMemoryLayer(eqx.Module):
             y_pred = k_c + jnp.einsum('bhde,bche->bchd', W1, act) # (B, cs, H, D)
             err = y_pred - v_c                                      # (B, cs, H, D)
 
-        # Gradient w.r.t. W1: (2/D) * err outer GELU(W2 @ k)
+        # Gradient computation in f32 for bf16 numerical stability
         with jax.named_scope("mem_grad"):
+            orig_dtype = err.dtype
+            err_f = err.astype(jnp.float32)
+            act_f = act.astype(jnp.float32)
             D = k_c.shape[-1]
             scale = 2.0 / D
-            u_W1 = scale * jnp.einsum('bchd,bche->bchde', err, act)  # (B, cs, H, D, E)
+            u_W1 = (scale * jnp.einsum('bchd,bche->bchde', err_f, act_f)).astype(orig_dtype)
             # Gradient w.r.t. W2: chain through GELU' and W1^T
-            gelu_prime = _gelu_derivative(h)                          # (B, cs, H, E)
-            w1t_err = jnp.einsum('bhde,bchd->bche', W1, err)         # (B, cs, H, E)
-            chain = w1t_err * gelu_prime                               # (B, cs, H, E)
-            u_W2 = scale * jnp.einsum('bche,bchd->bched', chain, k_c)  # (B, cs, H, E, D)
+            gelu_prime = _gelu_derivative(h)                                     # f32 (always)
+            w1t_err = jnp.einsum('bhde,bchd->bche', W1.astype(jnp.float32), err_f)
+            chain = w1t_err * gelu_prime
+            u_W2 = (scale * jnp.einsum('bche,bchd->bched', chain, k_c.astype(jnp.float32))).astype(orig_dtype)
 
         # Omega rule
         with jax.named_scope("omega"):

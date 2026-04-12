@@ -28,3 +28,6 @@ class AtlasConfig:
     num_persist_mem_tokens: int = 0  # learnable prefix tokens (PyTorch default = 4)
     stop_grad_chunks: bool = False   # True = paper (frozen boundary), False = PyTorch (gradient flows)
     geglu_ff: bool = True       # SiLU-gated feedforward (True = PyTorch GEGLU, False = plain GELU)
+    # MAG (Memory As Gate) settings
+    window_size: int = 64        # sliding window size for attention
+    neural_memory_layers: tuple | None = None  # which layers get memory (None = all)

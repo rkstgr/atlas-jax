@@ -47,6 +47,12 @@ def main():
                         help='Mixed precision: bf16 model weights, f32 optimizer')
     parser.add_argument('--fused-chunk', action='store_true', default=False,
                         help='Use fused Triton kernel')
+    parser.add_argument('--model', type=str, default='lmm', choices=['lmm', 'mag'],
+                        help='Architecture: lmm (memory only) or mag (memory + attention)')
+    parser.add_argument('--window-size', type=int, default=64,
+                        help='Sliding window size for MAG attention')
+    parser.add_argument('--memory-layers', type=str, default=None,
+                        help='Comma-separated layer indices for memory (MAG only, e.g. "1,3,5,7")')
     args = parser.parse_args()
 
     jax.config.update("jax_default_matmul_precision", "high" if args.bf16 else "float32")
@@ -75,11 +81,17 @@ def main():
         logit_softcap=0.0,
         stop_grad_chunks=args.stop_grad_chunks,
         geglu_ff=True,
-        num_persist_mem_tokens=4,  # PyTorch default
+        num_persist_mem_tokens=4 if args.model == 'lmm' else 0,
+        window_size=args.window_size,
+        neural_memory_layers=tuple(int(x) for x in args.memory_layers.split(',')) if args.memory_layers else None,
     )
 
     key, model_key = jax.random.split(key)
-    model = Atlas(config, key=model_key, pad_vocab_size_to=1)  # no padding for byte-level
+    if args.model == 'mag':
+        from atlas_jax.mag_transformer import MAGTransformer
+        model = MAGTransformer(config, key=model_key)
+    else:
+        model = Atlas(config, key=model_key, pad_vocab_size_to=1)
 
     if args.bf16:
         model = jax.tree.map(

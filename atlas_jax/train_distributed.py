@@ -234,6 +234,10 @@ def main():
     parser.add_argument('--window-size', type=int, default=64)
     parser.add_argument('--memory-layers', type=str, default=None,
                         help='Comma-separated layer indices for memory (MAG only)')
+    parser.add_argument('--stop-grad-chunks', action='store_true', default=False,
+                        help='Stop gradient at chunk boundaries (paper mode, more stable)')
+    parser.add_argument('--max-lr-gate', type=float, default=0.1,
+                        help='Max learning rate for eta gate')
 
     parser.add_argument('--batch-size', type=int, default=32,
                         help='GLOBAL batch size (split across all GPUs)')
@@ -309,6 +313,8 @@ def main():
         fused_chunk=args.fused_chunk,
         dropout=args.dropout,
         gate_bias_init=args.gate_bias_init,
+        stop_grad_chunks=args.stop_grad_chunks,
+        max_lr=args.max_lr_gate,
         window_size=args.window_size,
         neural_memory_layers=tuple(int(x) for x in args.memory_layers.split(',')) if args.memory_layers else None,
     )

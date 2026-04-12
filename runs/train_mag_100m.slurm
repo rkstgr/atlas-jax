@@ -31,7 +31,7 @@ srun python -m atlas_jax.train_distributed \
     --window-size=64 \
     --poly-degree=2 --omega-window=2 --chunk-size=64 \
     --ns-steps=5 --pe-ste \
-    --dropout=0.0 --gate-bias-init=0.0 \
+    --dropout=0.0 --gate-bias-init=0.0 --stop-grad-chunks \
     --seq-len=1024 \
     --batch-size=32 \
     --optimizer=adamw \

@@ -280,12 +280,12 @@ class AtlasMemoryLayer(eqx.Module):
         self.max_lr = config.max_lr
         self.stop_grad_chunks = config.stop_grad_chunks
         _d_is_pow2 = (D & (D - 1) == 0)
-        self.fused_chunk = config.fused_chunk and _HAS_FUSED_CHUNK and _d_is_pow2
-        if config.fused_chunk and _HAS_FUSED_CHUNK and not _d_is_pow2:
+        _e_is_pow2 = (E & (E - 1) == 0)
+        self.fused_chunk = config.fused_chunk and _HAS_FUSED_CHUNK and _d_is_pow2 and _e_is_pow2
+        if config.fused_chunk and _HAS_FUSED_CHUNK and not (_d_is_pow2 and _e_is_pow2):
             import warnings
             warnings.warn(
-                f"Fused chunk kernel disabled: D={D} is not a power of 2 "
-                f"(n_embd={config.n_embd}, n_head={config.n_head}). "
+                f"Fused chunk kernel disabled: D={D}, E={E} must both be powers of 2. "
                 f"Falling back to regular scan ops."
             )
 

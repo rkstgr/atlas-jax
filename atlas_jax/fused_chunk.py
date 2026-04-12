@@ -17,7 +17,7 @@ Forward:  Triton kernel (carry in registers, single launch)
 Backward: Recompute forward with regular JAX ops, then jax.vjp for gradients.
           This reuses the battle-tested Triton scan backward + PE STE backward.
 
-Requires D == E (memory_expand=1). Falls back to regular ops otherwise.
+Supports D != E (memory_expand > 1). W1 is (D, E) wide, W2 is (E, D) tall.
 """
 
 import math
@@ -49,24 +49,24 @@ def _pe_coeffs_flat(ns_steps):
 
 
 # ---------------------------------------------------------------------------
-# Triton forward kernel
+# Triton forward kernel — supports D != E (rectangular matrices)
 # ---------------------------------------------------------------------------
 
 if _HAS_TRITON:
     @triton.jit
     def _fused_chunk_fwd_kernel(
-        # --- Carry inputs: (B, H, D, E) contiguous ---
+        # --- Carry inputs: flattened to (B, H, D*E) ---
         W1_ptr, W2_ptr, SW1_ptr, SW2_ptr,
         # --- Per-timestep inputs ---
-        momW1_ptr,      # (B, cs, H, D*E) flattened last two dims
-        momW2_ptr,      # (B, cs, H, E*D) flattened last two dims
+        momW1_ptr,      # (B, cs, H, D*E) flattened
+        momW2_ptr,      # (B, cs, H, E*D) flattened
         theta_ptr,      # (B, cs, H)
         alpha_ptr,      # (B, cs, H)
         q_ptr,          # (B, cs, H, D)
         pe_coeffs_ptr,  # (ns_steps * 3,) flat f32
         # --- Single packed output buffer ---
         out_ptr,
-        # --- Offsets within output buffer (element offsets, not bytes) ---
+        # --- Offsets within output buffer ---
         y_off: tl.constexpr,
         w1o_off: tl.constexpr,
         w2o_off: tl.constexpr,
@@ -76,26 +76,28 @@ if _HAS_TRITON:
         cs: tl.constexpr,
         H: tl.constexpr,
         D: tl.constexpr,
-        DE: tl.constexpr,       # D * E (= D * D when expand=1)
+        E: tl.constexpr,
+        DE: tl.constexpr,       # D * E
         ns_steps: tl.constexpr,
-        BD: tl.constexpr,       # block size for D dim (padded, power of 2)
-        BDE: tl.constexpr,      # block size for D*E (padded)
-        # --- Strides (in elements) ---
-        # carry: (B, H, DE) after reshape
-        sc_b, sc_h,
-        # mom: (B, cs, H, DE)
-        sm_b, sm_t, sm_h,
-        # gates: (B, cs, H)
-        sg_b, sg_t,
-        # q/y: (B, cs, H, D)
-        sq_b, sq_t, sq_h,
+        BD: tl.constexpr,       # block size for D (padded pow2)
+        BE: tl.constexpr,       # block size for E (padded pow2)
+        BDE: tl.constexpr,      # BD * BE (padded D*E)
+        # --- Strides ---
+        sc_b, sc_h,             # carry: (B, H, DE)
+        sm_b, sm_t, sm_h,       # mom: (B, cs, H, DE)
+        sg_b, sg_t,             # gates: (B, cs, H)
+        sq_b, sq_t, sq_h,       # q/y: (B, cs, H, D)
     ):
-        """Fused forward: momentum → PE → memory → output, carry stays in registers."""
+        """Fused forward: momentum → PE → memory → output, carry in registers.
+
+        W1 is (D, E) — wide when E > D. PE: A = X @ X^T, X_new = a*X + B @ X
+        W2 is (E, D) — tall when E > D. PE: A = X^T @ X, X_new = a*X + X @ B
+        """
         pid = tl.program_id(0)
         b = pid // H
         h = pid % H
 
-        # --- Load carry state into registers (upcast to f32) ---
+        # --- Load carry state into registers (f32) ---
         de_range = tl.arange(0, BDE)
         de_mask = de_range < DE
         c_off = b * sc_b + h * sc_h
@@ -107,6 +109,8 @@ if _HAS_TRITON:
 
         d_range = tl.arange(0, BD)
         d_mask = d_range < D
+        e_range = tl.arange(0, BE)
+        e_mask = e_range < E
 
         # --- Sequential loop over timesteps ---
         for t in range(cs):
@@ -124,64 +128,55 @@ if _HAS_TRITON:
             SW1 = theta_t * SW1 + mW1
             SW2 = theta_t * SW2 + mW2
 
-            # --- Polar Express for SW1 (operates on flat D*E vector) ---
-            # Frobenius normalize
+            # --- Polar Express for SW1: (D, E) wide matrix ---
+            # Wide/square: A = X @ X^T (BD, BD), X_new = a*X + B @ X
             frob_sq = tl.sum(SW1 * SW1)
             inv_frob = 1.0 / (tl.sqrt(frob_sq + 1e-12) * 1.01 + 1e-6)
             X1 = SW1 * inv_frob
-
-            # Newton-Schulz iterations (flat vector form)
-            # For D==E square matrices stored as flat (D*E,) vectors:
-            #   A = X @ X^T (D,D), B = b*A + c*A^2, X = a*X + B @ X
-            # We implement this with reshape tricks in the flat representation.
-            # X reshaped to (D, D): X_mat[i,j] = X[i*D + j]
-            # A = X_mat @ X_mat^T: A[i,j] = sum_k X_mat[i,k] * X_mat[j,k]
-            #                             = sum_k X[i*D+k] * X[j*D+k]
-            # This requires 2D operations. We use tl.reshape + tl.dot.
-            X1_2d = tl.reshape(X1, (BD, BD))
+            X1_2d = tl.reshape(X1, (BD, BE))  # (BD, BE) = (D, E) padded
             for step in range(ns_steps):
                 a_c = tl.load(pe_coeffs_ptr + step * 3).to(tl.float32)
                 b_c = tl.load(pe_coeffs_ptr + step * 3 + 1).to(tl.float32)
                 c_c = tl.load(pe_coeffs_ptr + step * 3 + 2).to(tl.float32)
-                A = tl.dot(X1_2d, tl.trans(X1_2d))          # (BD, BD)
+                A = tl.dot(X1_2d, tl.trans(X1_2d))          # (BD, BE) @ (BE, BD) = (BD, BD)
                 AA = tl.dot(A, A)                             # (BD, BD)
                 B_mat = b_c * A + c_c * AA                    # (BD, BD)
-                X1_2d = a_c * X1_2d + tl.dot(B_mat, X1_2d)  # (BD, BD)
+                X1_2d = a_c * X1_2d + tl.dot(B_mat, X1_2d)  # (BD, BD) @ (BD, BE) = (BD, BE)
             SW1_orth = tl.reshape(X1_2d, (BDE,))
 
-            # --- Polar Express for SW2 ---
+            # --- Polar Express for SW2: (E, D) tall matrix ---
+            # Tall: A = X^T @ X (BD, BD), X_new = a*X + X @ B
             frob_sq = tl.sum(SW2 * SW2)
             inv_frob = 1.0 / (tl.sqrt(frob_sq + 1e-12) * 1.01 + 1e-6)
             X2 = SW2 * inv_frob
-            X2_2d = tl.reshape(X2, (BD, BD))
+            X2_2d = tl.reshape(X2, (BE, BD))  # (BE, BD) = (E, D) padded
             for step in range(ns_steps):
                 a_c = tl.load(pe_coeffs_ptr + step * 3).to(tl.float32)
                 b_c = tl.load(pe_coeffs_ptr + step * 3 + 1).to(tl.float32)
                 c_c = tl.load(pe_coeffs_ptr + step * 3 + 2).to(tl.float32)
-                A = tl.dot(X2_2d, tl.trans(X2_2d))
-                AA = tl.dot(A, A)
-                B_mat = b_c * A + c_c * AA
-                X2_2d = a_c * X2_2d + tl.dot(B_mat, X2_2d)
+                A = tl.dot(tl.trans(X2_2d), X2_2d)          # (BD, BE) @ (BE, BD) = (BD, BD)
+                AA = tl.dot(A, A)                             # (BD, BD)
+                B_mat = b_c * A + c_c * AA                    # (BD, BD)
+                X2_2d = a_c * X2_2d + tl.dot(X2_2d, B_mat)  # (BE, BD) @ (BD, BD) = (BE, BD)
             SW2_orth = tl.reshape(X2_2d, (BDE,))
 
             # --- Memory update: W = alpha * W + PE(S) ---
             W1 = alpha_t * W1 + SW1_orth
             W2 = alpha_t * W2 + SW2_orth
 
-            # --- Output: y = q + W1_mat @ gelu(W2_mat @ q) ---
+            # --- Output: y = q + W1 @ gelu(W2 @ q) ---
             q_off = b * sq_b + t * sq_t + h * sq_h
             q_vec = tl.load(q_ptr + q_off + d_range, mask=d_mask, other=0.0).to(tl.float32)
 
-            # W2 @ q: reshape W2 to (D, D), matrix-vector product
-            W2_2d = tl.reshape(W2, (BD, BD))   # (D, D)
-            # h_q[i] = sum_j W2_2d[i,j] * q[j]
-            h_q = tl.sum(W2_2d * q_vec[None, :], axis=1)  # (BD,)
+            # W2 @ q: (E, D) @ (D,) = (E,)
+            W2_2d = tl.reshape(W2, (BE, BD))
+            h_q = tl.sum(W2_2d * q_vec[None, :], axis=1)  # (BE,)
 
-            # GELU: exact form x * 0.5 * (1 + erf(x / sqrt(2)))
+            # GELU
             g_q = h_q * 0.5 * (1.0 + tl.erf(h_q * 0.7071067811865476))
 
-            # W1 @ gelu: reshape W1 to (D, D)
-            W1_2d = tl.reshape(W1, (BD, BD))
+            # W1 @ gelu(h): (D, E) @ (E,) = (D,)
+            W1_2d = tl.reshape(W1, (BD, BE))
             y_vec = q_vec + tl.sum(W1_2d * g_q[None, :], axis=1)  # (BD,)
 
             # Store y[t] (bf16)
@@ -203,35 +198,22 @@ def _triton_fused_fwd(W1, W2, SW1, SW2, momW1, momW2, theta, alpha, q,
                        pe_coeffs, ns_steps):
     """Run the fused forward Triton kernel.
 
-    Args:
-        W1, W2, SW1, SW2: (B, H, D, E) / (B, H, E, D) carry state
-        momW1: (B, cs, H, D, E) pre-computed momentum input for W1
-        momW2: (B, cs, H, E, D) pre-computed momentum input for W2
-        theta, alpha: (B, cs, H) gates
-        q: (B, cs, H, D) query vectors
-        pe_coeffs: (ns_steps*3,) flat f32 PE coefficients
-        ns_steps: number of PE iterations
-
-    Returns:
-        y: (B, cs, H, D) output
-        W1_out, W2_out, SW1_out, SW2_out: updated carry
+    Supports D != E (memory_expand > 1). W1 is (B,H,D,E), W2 is (B,H,E,D).
+    Both D and E must be powers of 2 (for tl.reshape alignment).
     """
     B, H_, D, E = W1.shape
-    assert D == E, f"Fused kernel requires D==E, got D={D}, E={E}"
-    assert D & (D - 1) == 0, (
-        f"Fused kernel requires D to be a power of 2 (got D={D}). "
-        f"The flat-to-2D reshape assumes stride==BD, which only holds when D==BD. "
-        f"Use --no-fused-chunk or choose n_embd/n_head that gives a power-of-2 D."
-    )
+    assert D & (D - 1) == 0, f"D must be power of 2, got {D}"
+    assert E & (E - 1) == 0, f"E must be power of 2, got {E}"
     cs = momW1.shape[1]
     H = H_
     DE = D * E
 
-    # Pad D to next power of 2 (minimum 16 for tl.dot tensor core alignment)
+    # Pad to next power of 2 (minimum 16 for tensor core alignment)
     BD = max(triton.next_power_of_2(D), 16)
-    BDE = BD * BD  # since D == E, BD == BE
+    BE = max(triton.next_power_of_2(E), 16)
+    BDE = BD * BE
 
-    # Flatten last two dims of carry and mom for flat-vector kernel
+    # Flatten last two dims for flat-vector kernel
     W1_flat = W1.reshape(B, H, DE)
     W2_flat = W2.reshape(B, H, DE)
     SW1_flat = SW1.reshape(B, H, DE)
@@ -239,28 +221,16 @@ def _triton_fused_fwd(W1, W2, SW1, SW2, momW1, momW2, theta, alpha, q,
     momW1_flat = momW1.reshape(B, cs, H, DE)
     momW2_flat = momW2.reshape(B, cs, H, DE)
 
-    # Compute output buffer layout (element counts)
+    # Output buffer layout
     y_size = B * cs * H * D
-    carry_size = B * H * DE  # same for all 4 carry arrays
+    carry_size = B * H * DE
     total_size = y_size + 4 * carry_size
 
-    # Strides for flat carry: (B, H, DE) contiguous
-    sc_b = H * DE
-    sc_h = DE
-
-    # Strides for flat mom: (B, cs, H, DE) contiguous
-    sm_b = cs * H * DE
-    sm_t = H * DE
-    sm_h = DE
-
-    # Strides for gates: (B, cs, H) contiguous
-    sg_b = cs * H
-    sg_t = H
-
-    # Strides for q/y: (B, cs, H, D) contiguous
-    sq_b = cs * H * D
-    sq_t = H * D
-    sq_h = D
+    # Strides
+    sc_b, sc_h = H * DE, DE
+    sm_b, sm_t, sm_h = cs * H * DE, H * DE, DE
+    sg_b, sg_t = cs * H, H
+    sq_b, sq_t, sq_h = cs * H * D, H * D, D
 
     # Output section offsets
     y_off = 0
@@ -284,7 +254,8 @@ def _triton_fused_fwd(W1, W2, SW1, SW2, momW1, momW2, theta, alpha, q,
         y_off=y_off, w1o_off=w1o_off, w2o_off=w2o_off,
         sw1o_off=sw1o_off, sw2o_off=sw2o_off,
         # Dimensions
-        cs=cs, H=H, D=D, DE=DE, ns_steps=ns_steps, BD=BD, BDE=BDE,
+        cs=cs, H=H, D=D, E=E, DE=DE, ns_steps=ns_steps,
+        BD=BD, BE=BE, BDE=BDE,
         # Strides
         sc_b=sc_b, sc_h=sc_h,
         sm_b=sm_b, sm_t=sm_t, sm_h=sm_h,
@@ -317,9 +288,6 @@ def _regular_fwd(W1, W2, SW1, SW2, momW1, momW2, theta, alpha, q,
     if _scan is None:
         raise RuntimeError("Triton scan required for fused_chunk backward")
 
-    # Must use JAX PE here (not Triton PE) because _regular_fwd runs inside
-    # jax.vjp which needs to differentiate through it. Triton kernels via
-    # jax_triton.triton_call are not automatically differentiable.
     _pe = polar_express_ste if pe_ste else polar_express
 
     # Momentum scans: S[t] = theta[t] * S[t-1] + mom[t]
@@ -339,8 +307,6 @@ def _regular_fwd(W1, W2, SW1, SW2, momW1, momW2, theta, alpha, q,
     g_q = jax.nn.gelu(h_q)
     y = q + jnp.einsum('bchde,bche->bchd', W1_all, g_q)
 
-    # Cast to match input dtype (the fused Triton kernel outputs bf16,
-    # so the backward vjp must also work in the same dtype space)
     out_dtype = W1.dtype
     y = y.astype(out_dtype)
     state = DeepMemoryState(
@@ -352,27 +318,20 @@ def _regular_fwd(W1, W2, SW1, SW2, momW1, momW2, theta, alpha, q,
 # ---------------------------------------------------------------------------
 # Public API: module-level custom_vjp with nondiff_argnums
 # ---------------------------------------------------------------------------
-# Uses nondiff_argnums for ns_steps/pe_ste (static Python ints/bools).
-# This matches the triton_linear_scan pattern which works correctly under
-# eqx.filter_value_and_grad. The previous factory+custom_vmap pattern broke
-# VJP: custom_vmap wrapping custom_vjp from the outside prevented JAX from
-# seeing the custom_vjp rules, causing a CustomVJPException about closed-over
-# values and producing zero gradients (the cause of the training plateau).
 
 @partial(jax.custom_vjp, nondiff_argnums=(9, 10))
 def fused_chunk_scan(W1, W2, SW1, SW2, momW1, momW2, theta, alpha, q,
                       ns_steps, pe_ste):
     """Fused chunk scan: momentum + PE + memory + output in one Triton kernel.
 
-    This is the "FlashATLAS" kernel. Keeps W1, W2, S_W1, S_W2 in GPU registers
-    across all cs timesteps, eliminating HBM round-trips.
+    Supports D != E (memory_expand > 1). W1 is (D,E), W2 is (E,D).
 
     Args:
         W1:    (B, H, D, E) initial memory weight 1
         W2:    (B, H, E, D) initial memory weight 2
         SW1:   (B, H, D, E) initial momentum for W1
         SW2:   (B, H, E, D) initial momentum for W2
-        momW1: (B, cs, H, D, E) pre-computed momentum input (-eta * omega_grad)
+        momW1: (B, cs, H, D, E) pre-computed momentum input
         momW2: (B, cs, H, E, D) pre-computed momentum input
         theta: (B, cs, H) momentum gate
         alpha: (B, cs, H) forget gate
@@ -399,7 +358,6 @@ def fused_chunk_scan(W1, W2, SW1, SW2, momW1, momW2, theta, alpha, q,
 
 def _fused_scan_fwd(W1, W2, SW1, SW2, momW1, momW2, theta, alpha, q,
                      ns_steps, pe_ste):
-    """custom_vjp forward: run fused Triton kernel, save inputs as residuals."""
     result = fused_chunk_scan(W1, W2, SW1, SW2, momW1, momW2, theta, alpha, q,
                                ns_steps, pe_ste)
     residuals = (W1, W2, SW1, SW2, momW1, momW2, theta, alpha, q)
@@ -407,12 +365,6 @@ def _fused_scan_fwd(W1, W2, SW1, SW2, momW1, momW2, theta, alpha, q,
 
 
 def _fused_scan_bwd(ns_steps, pe_ste, residuals, grads):
-    """custom_vjp backward: recompute with regular JAX ops, then vjp.
-
-    Uses existing triton_linear_scan backward + PE STE backward + JAX
-    autodiff for einsums. One extra forward recomputation, but with fast
-    Triton scan kernels.
-    """
     W1, W2, SW1, SW2, momW1, momW2, theta, alpha, q = residuals
     grad_y, grad_state = grads
 

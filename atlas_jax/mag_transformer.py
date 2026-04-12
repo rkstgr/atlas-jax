@@ -118,7 +118,7 @@ class MAGTransformer(eqx.Module):
             lambda m: m.weight, self.lm_head,
             jax.random.normal(init_key, self.lm_head.weight.shape) * 0.02)
 
-    def __call__(self, idx, memory_states=None):
+    def __call__(self, idx, memory_states=None, *, dropout_key=None):
         """Forward pass.
 
         Args:

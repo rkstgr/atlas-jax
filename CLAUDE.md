@@ -120,6 +120,27 @@ Per-layer fwd+bwd at B=2, T=2048:
 Bottleneck is PE + einsum operations within each chunk, NOT the scan iteration count.
 `linear_scan` (sequential or associative) is <1% of total time.
 
+## Scaling Benchmarks (H100, bf16, seq=1024, fwd+bwd+optim)
+
+| Model | Expand | Mode | Batch | ms/step | tok/s | Speedup |
+|-------|--------|------|-------|---------|-------|---------|
+| 100M (12L, 768d) | 1 | non-fused | 24 | 13,539 | 1,815 | — |
+| | 1 | **fused** | 20 | 6,495 | **3,153** | **1.74×** |
+| | 2 | non-fused | 22 | 19,789 | 1,138 | — |
+| | 2 | **fused** | 16 | 8,722 | **1,879** | **1.65×** |
+| 1.2B (24L, 2048d) | 1 | non-fused | 4 | 12,684 | 323 | — |
+| | 1 | **fused** | 4 | 7,606 | **538** | **1.67×** |
+| | 2 | non-fused | 4 | 19,947 | 205 | — |
+| | 2 | **fused** | 2 | 6,641 | **308** | **1.50×** |
+
+Fused Triton kernel gives **1.5–1.7× throughput** at scale, even with reduced batch
+from higher memory use. Speedup comes from eliminating HBM round-trips for carry state
+(W1, W2, S_W1, S_W2) across all timesteps within each chunk.
+
+**1.2B on 5B tokens** (best config, 16×H100): ~6.7 days. With bf16 optimization: ~3–4 days.
+For reference, a GPT-2 Transformer (nanochat) does the same scale in ~1 hour — the gap
+is inherent to Atlas's sequential memory scan vs Transformer's parallel attention.
+
 ## Known Issues / TODOs
 
 1. **Muon optimizer not wired up** — `optim.py` has the Muon transform but `train.py`

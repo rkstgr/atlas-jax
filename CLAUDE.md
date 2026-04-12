@@ -53,15 +53,21 @@ can produce incorrect gradients in some JAX/XLA configurations.
 Uses `x @ weight.T` instead of `jax.vmap(eqx.nn.Linear)(x)` for projections. Avoids
 vmap tracing overhead and is equivalent for bias-free linear layers.
 
-### 5. Weight initialization (_init_weights in model.py)
+### 5. Weight initialization (_init_block_weights in model.py)
 
-- `c_proj` (memory output) and `mlp.c_proj` initialized to **zero** so residual blocks
-  start as identity — critical for stable deep networks
-- Gate weights (alpha, eta, theta, gamma) initialized small (std=0.01) so sigmoid ≈ 0.5
+Per paper (Section 9):
+- `c_proj` output projections: GPT-2 style scaled init (std = 0.02 / sqrt(2*n_layer))
+- Gate projections: **zero weights + bias at -2.0** (sigmoid(-2) ≈ 0.12 initially)
+  This is critical — without the -2.0 bias, gates start at 0.5 and gradients explode.
+- Q/K/V projections: Xavier uniform (std = 1/sqrt(fan_in))
 - `lm_head` initialized small (std=0.02)
-- Other weights use Equinox defaults (Lecun normal)
 
-### 6. f32 matmul precision (train.py)
+### 6. Dropout (model.py)
+
+Paper specifies dropout=0.1 after memory layer output and MLP output. Applied during
+training only (pass `dropout_key` to `model(idx, dropout_key=key)`; omit for eval).
+
+### 7. f32 matmul precision (train.py)
 
 `jax.config.update("jax_default_matmul_precision", "float32")` is set in train.py.
 TF32 (H100 default) caused NaN in early experiments. Can be relaxed to "high" or
@@ -71,12 +77,16 @@ removed once bf16 training is properly implemented.
 
 | Aspect | Paper | Our Implementation | Reason |
 |--------|-------|--------------------|--------|
-| memory_expand | 4 | 1 (configurable) | 3.2× faster; expand=1 deep still beats linear per paper |
-| ns_steps | 5 | 3 (configurable) | 1.5× faster PE forward; nanochat PyTorch found this works |
+| memory_expand | 4 | 1 (configurable) | Fused Triton kernel requires D==E; expand=1 is 12.8× faster |
+| ns_steps | 5 | 5 (configurable) | Matches paper now |
+| poly_degree | 2 | 2 (configurable) | Matches paper now |
 | PE backward | Full | STE (stop_gradient) | 62× faster backward; paper validates this |
-| Outer optimizer | AdamW (paper) / Muon (nanochat) | AdamW (optax) | Muon transform written but multi_transform param grouping not yet wired up |
+| Outer optimizer | AdamW | AdamW (optax) with grad clip 1.0 | Matches paper; Muon also available |
 | Chunk gradient | Frozen boundary | stop_gradient on carry | Matches paper exactly |
-| Layer norm | End of each chunk (paper) | Not implemented | TODO |
+| Gate init | bias=-2 (sigmoid≈0.12) | bias=-2.0 | Matches paper |
+| Dropout | 0.1 | 0.1 (configurable) | Matches paper |
+| Gradient clipping | max norm 1.0 | clip_by_global_norm(1.0) | Matches paper |
+| Layer norm at chunk boundary | Paper mentions it | Not implemented | RMS norm on memory state was destructive; removed |
 
 ## First Training Results (2026-04-01)
 

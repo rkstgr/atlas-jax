@@ -143,16 +143,18 @@ is inherent to Atlas's sequential memory scan vs Transformer's parallel attentio
 
 ## PyTorch vs JAX Comparison (MAG 10M, 1×H100, enwik8, 1000 steps)
 
-| Variant | tok/s | Best val_loss | vs PyTorch |
-|---------|-------|---------------|------------|
-| PyTorch MAG (f32) | 6,861 | **1.549** | baseline |
-| JAX f32 nonfused | 10,016 | 1.583 | +2.2% loss, 1.46× faster |
-| JAX f32 fused | 10,665 | 1.584 | +2.2% loss, 1.55× faster |
-| JAX bf16 fused | 11,317 | 1.610 | +3.9% loss, 1.65× faster |
+| Variant | tok/s | Best val_loss | Peak GPU Memory | vs PyTorch |
+|---------|-------|---------------|-----------------|------------|
+| PyTorch MAG (f32) | 6,861 | **1.549** | 32.80 GB | baseline |
+| JAX f32 nonfused | 10,016 | 1.583 | 1.25 GB | +2.2% loss, 1.46× faster, 26× less memory |
+| JAX f32 fused | 10,665 | 1.584 | 1.69 GB | +2.2% loss, 1.55× faster, 19× less memory |
+| JAX bf16 fused | 11,317 | 1.610 | 1.69 GB | +3.9% loss, 1.65× faster, 19× less memory |
 
-Loss curves match within 2–4%. JAX is 1.5–1.65× faster than PyTorch on the same
-hardware. The small quality gap is from missing ResidualNorm (PyTorch wraps memory
-MLP in LayerNorm; our analytical gradients use plain residual).
+Loss curves match within 2–4%. JAX is 1.5–1.65× faster and uses 19–26× less GPU
+memory than PyTorch. The memory gap comes from analytical gradients (einsum) vs
+PyTorch's `torch.func.vmap(grad(...))` which materializes per-sample gradient tensors.
+The small quality gap is from missing ResidualNorm (PyTorch wraps memory MLP in
+LayerNorm; our analytical gradients use plain residual).
 
 ## Known Issues / TODOs
 

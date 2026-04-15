@@ -10,7 +10,6 @@ Data-parallel training via shard_map:
 import os
 import sys
 import time
-import math
 import argparse
 from functools import partial
 from dataclasses import asdict
@@ -26,50 +25,18 @@ from atlas_jax.config import AtlasConfig
 from atlas_jax.model import Atlas
 from atlas_jax.data import data_loader
 from atlas_jax.tokenizer import get_tokenizer
-
-# H100 SXM bf16 peak TFLOPS
-GPU_PEAK_TFLOPS = {"H100": 989.4, "RTX8000": 32.6}
-
-
-def estimate_flops_per_token(config, n_params, n_embed_params):
-    """Estimate FLOPs per token (forward + backward = 6N + memory ops)."""
-    H = config.n_head
-    D = config.n_embd // H
-    E = config.memory_expand * D if config.deep_memory else D
-    if config.deep_memory:
-        elementwise_flops = H * (D * E + E * D) * 5
-        ns_flops = 2 * 3 * config.ns_steps * 2 * H * max(D, E) ** 3
-    else:
-        elementwise_flops = H * D * D * 5
-        ns_flops = 3 * config.ns_steps * 2 * H * D * D * D
-    memory_flops_per_token = (elementwise_flops + ns_flops) * config.n_layer
-    return 6 * (n_params - n_embed_params) + memory_flops_per_token
+from atlas_jax.metrics import (
+    BPB_FACTOR,
+    GPU_PEAK_TFLOPS,
+    estimate_flops_per_token,
+    loss_fn as _loss_fn,
+    upcast_grads as _upcast_grads,
+)
 
 
 # ---------------------------------------------------------------------------
 # Train / eval steps
 # ---------------------------------------------------------------------------
-
-def _loss_fn(model, inputs, targets):
-    """Cross-entropy loss (shared by train and eval)."""
-    logits, _ = model(inputs)
-    logits_flat = logits.reshape(-1, logits.shape[-1])
-    targets_flat = targets.reshape(-1)
-    log_probs = jax.nn.log_softmax(logits_flat, axis=-1)
-    return -jnp.mean(log_probs[jnp.arange(targets_flat.shape[0]), targets_flat])
-
-
-def _upcast_grads(grads):
-    """Cast bf16 gradients to f32 for numerically stable optimizer updates.
-
-    Without this, optax.clip_by_global_norm squares bf16 values, which
-    overflows to inf for any gradient > 256 (since 256^2 > bf16 max).
-    """
-    def _cast(x):
-        if eqx.is_array(x) and x.dtype == jnp.bfloat16:
-            return x.astype(jnp.float32)
-        return x
-    return jax.tree.map(_cast, grads, is_leaf=eqx.is_array)
 
 
 def make_train_step(mesh):
@@ -252,14 +219,6 @@ def main():
         return x.astype(jnp.bfloat16) if eqx.is_array(x) and x.dtype == jnp.float32 else x
     model = jax.tree.map(_to_bf16, model, is_leaf=eqx.is_array)
     print(f"Model cast to bf16")
-
-    # BPB conversion: BPB = loss * (1 / ln(2)) * (tokens / bytes)
-    # For BPE tokenizers, ~3.3 chars/token on average for English text
-    # More precisely: BPB = cross_entropy_nats / ln(2) / chars_per_token
-    # We use the standard approximation: BPB ≈ loss / ln(2) / 3.3
-    # This matches nanochat's convention
-    CHARS_PER_TOKEN = 3.3
-    BPB_FACTOR = 1.0 / (math.log(2) * CHARS_PER_TOKEN)
 
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,

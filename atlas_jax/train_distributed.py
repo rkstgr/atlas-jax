@@ -11,12 +11,10 @@ Launch: srun --ntasks=N --gres=gpu:N python -m atlas_jax.train_distributed [args
 import os
 import sys
 import time
-import math
 import signal
 import argparse
 from functools import partial
 from dataclasses import asdict
-from pathlib import Path
 
 # --- Multi-process setup: MUST happen before any JAX computation ---
 _LOCAL_RANK = int(os.environ.get("SLURM_LOCALID", "0"))   # 0-3 per node
@@ -43,89 +41,23 @@ import optax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.experimental.shard_map import shard_map
 
+from atlas_jax.checkpoint import save_checkpoint, load_checkpoint
 from atlas_jax.config import AtlasConfig
+from atlas_jax.metrics import (
+    BPB_FACTOR,
+    estimate_flops_per_token,
+    loss_fn as _loss_fn,
+    upcast_grads as _upcast_grads,
+)
 from atlas_jax.model import Atlas
 from atlas_jax.data import data_loader
 from atlas_jax.tokenizer import get_tokenizer
-from atlas_jax.train import estimate_flops_per_token
 from atlas_jax.optim import build_optimizer
-
-
-# ---------------------------------------------------------------------------
-# Checkpointing
-# ---------------------------------------------------------------------------
-
-def _to_cpu(x):
-    """Move array to CPU for serialization."""
-    if eqx.is_array(x):
-        return jax.device_get(x)
-    return x
-
-
-def save_checkpoint(model, opt_state, step, ckpt_dir, rank=0):
-    """Save model + optimizer state to disk. Only rank 0 writes."""
-    if rank != 0:
-        return
-    ckpt_dir = Path(ckpt_dir)
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-
-    # Move to CPU for serialization
-    model_cpu = jax.tree.map(_to_cpu, model, is_leaf=eqx.is_array)
-    opt_cpu = jax.tree.map(_to_cpu, opt_state, is_leaf=eqx.is_array)
-
-    tmp_model = ckpt_dir / "model.eqx.tmp"
-    tmp_opt = ckpt_dir / "opt_state.eqx.tmp"
-    tmp_meta = ckpt_dir / "meta.tmp"
-
-    eqx.tree_serialise_leaves(str(tmp_model), model_cpu)
-    eqx.tree_serialise_leaves(str(tmp_opt), opt_cpu)
-    with open(tmp_meta, 'w') as f:
-        f.write(f"{step}\n")
-
-    # Atomic rename
-    tmp_model.rename(ckpt_dir / "model.eqx")
-    tmp_opt.rename(ckpt_dir / "opt_state.eqx")
-    tmp_meta.rename(ckpt_dir / "meta.txt")
-    print(f"[ckpt] Saved step {step} to {ckpt_dir}", flush=True)
-
-
-def load_checkpoint(model, opt_state, ckpt_dir):
-    """Load model + optimizer state from disk. Returns (model, opt_state, step)."""
-    ckpt_dir = Path(ckpt_dir)
-    model_path = ckpt_dir / "model.eqx"
-    opt_path = ckpt_dir / "opt_state.eqx"
-    meta_path = ckpt_dir / "meta.txt"
-
-    if not model_path.exists():
-        return model, opt_state, 0
-
-    model = eqx.tree_deserialise_leaves(str(model_path), model)
-    opt_state = eqx.tree_deserialise_leaves(str(opt_path), opt_state)
-    with open(meta_path) as f:
-        step = int(f.read().strip())
-
-    print(f"[ckpt] Resumed from step {step} at {ckpt_dir}", flush=True)
-    return model, opt_state, step
 
 
 # ---------------------------------------------------------------------------
 # Train / eval steps (multi-process via shard_map)
 # ---------------------------------------------------------------------------
-
-def _loss_fn(model, inputs, targets, dropout_key=None):
-    logits, _ = model(inputs, dropout_key=dropout_key)
-    logits_flat = logits.reshape(-1, logits.shape[-1])
-    targets_flat = targets.reshape(-1)
-    log_probs = jax.nn.log_softmax(logits_flat, axis=-1)
-    return -jnp.mean(log_probs[jnp.arange(targets_flat.shape[0]), targets_flat])
-
-
-def _upcast_grads(grads):
-    def _cast(x):
-        if eqx.is_array(x) and x.dtype == jnp.bfloat16:
-            return x.astype(jnp.float32)
-        return x
-    return jax.tree.map(_cast, grads, is_leaf=eqx.is_array)
 
 
 def make_train_step(mesh, optimizer, model, opt_state):
@@ -334,9 +266,6 @@ def main():
     # Cast to bf16 (after checkpoint load to avoid dtype mismatch)
     def _to_bf16(x):
         return x.astype(jnp.bfloat16) if eqx.is_array(x) and x.dtype == jnp.float32 else x
-
-    CHARS_PER_TOKEN = 3.3
-    BPB_FACTOR = 1.0 / (math.log(2) * CHARS_PER_TOKEN)
 
     if args.optimizer == 'muon':
         optimizer, param_labels = build_optimizer(

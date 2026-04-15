@@ -16,4 +16,4 @@ export PYTHONUNBUFFERED=1
 
 cd /p/project1/westai0047/atlas-jax
 source .venv/bin/activate
-srun python debug_nan.py
+srun python scripts/diagnostics/debug_nan.py

@@ -369,18 +369,18 @@ def main():
         )
         log(f"Optimizer: AdamW (lr={args.lr}, wd={args.weight_decay})")
 
+    # Cast to bf16 before optimizer init (so optimizer moments match checkpoint dtype)
+    model = jax.tree.map(_to_bf16, model, is_leaf=eqx.is_array)
+    log("Model cast to bf16")
+
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
-    # Resume from checkpoint if available (before bf16 cast)
+    # Resume from checkpoint if available
     start_step = 0
     if args.ckpt_dir:
         model, opt_state, start_step = load_checkpoint(model, opt_state, args.ckpt_dir)
         if start_step > 0:
             log(f"Resumed from checkpoint at step {start_step}")
-
-    # Now cast to bf16
-    model = jax.tree.map(_to_bf16, model, is_leaf=eqx.is_array)
-    log("Model cast to bf16")
 
     # Replicate model and opt_state across all devices
     def _replicate(x):

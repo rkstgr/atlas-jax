@@ -331,11 +331,9 @@ def main():
     flops_per_token = estimate_flops_per_token(config, n_params, n_embed_params)
     log(f"Parameters: {n_params:,} | FLOPs/token: {flops_per_token:,.0f}")
 
-    # Cast to bf16
+    # Cast to bf16 (after checkpoint load to avoid dtype mismatch)
     def _to_bf16(x):
         return x.astype(jnp.bfloat16) if eqx.is_array(x) and x.dtype == jnp.float32 else x
-    model = jax.tree.map(_to_bf16, model, is_leaf=eqx.is_array)
-    log("Model cast to bf16")
 
     CHARS_PER_TOKEN = 3.3
     BPB_FACTOR = 1.0 / (math.log(2) * CHARS_PER_TOKEN)
@@ -373,12 +371,16 @@ def main():
 
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
-    # Resume from checkpoint if available
+    # Resume from checkpoint if available (before bf16 cast)
     start_step = 0
     if args.ckpt_dir:
         model, opt_state, start_step = load_checkpoint(model, opt_state, args.ckpt_dir)
         if start_step > 0:
             log(f"Resumed from checkpoint at step {start_step}")
+
+    # Now cast to bf16
+    model = jax.tree.map(_to_bf16, model, is_leaf=eqx.is_array)
+    log("Model cast to bf16")
 
     # Replicate model and opt_state across all devices
     def _replicate(x):

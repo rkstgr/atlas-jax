@@ -5,7 +5,7 @@
 #SBATCH --ntasks-per-node=4
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=8
-#SBATCH --time=08:00:00
+#SBATCH --time=24:00:00
 #SBATCH --job-name=mag150m
 #SBATCH --output=/p/scratch/westai0047/nanochat/logs/%x_%j.out
 #SBATCH --error=/p/scratch/westai0047/nanochat/logs/%x_%j.err

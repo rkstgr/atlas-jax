@@ -26,11 +26,11 @@ python -m pytest tests/test_fused_chunk.py -v --tb=short 2>&1 || { echo "FAILED"
 # Step 2: PE microbenchmark (shows JAX PE vs Triton PE)
 echo ""
 echo "==> PE microbenchmark (TF32)..."
-srun python -m atlas_jax.profile_pe --matmul-precision high
+srun python scripts/profile_pe.py --matmul-precision high
 
 # Step 3: Full model comparison
 echo ""
 echo "==> Full model profile..."
-srun python -m atlas_jax.profile_fused --preset h100
+srun python scripts/profile_fused.py --preset h100
 
 echo "==> Done $(date)"

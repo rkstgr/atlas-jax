@@ -12,8 +12,8 @@ from functools import partial
 
 from atlas_jax.config import AtlasConfig
 from atlas_jax.model import AtlasMemoryLayer, linear_scan, rms_norm, _gelu_derivative, _omega_aggregate
-from atlas_jax.polar_express import polar_express, polar_express_ste, POLAR_EXPRESS_COEFFS
-from atlas_jax.state import DeepMemoryState
+from atlas_jax.memory_layer import polar_express, polar_express_ste, POLAR_EXPRESS_COEFFS
+from atlas_jax.memory_layer import DeepMemoryState
 
 
 def time_fn(fn, *args, warmup=3, repeats=10):
@@ -101,7 +101,7 @@ def main():
 
     # Triton fused PE
     try:
-        from atlas_jax.triton_pe import triton_polar_express, triton_polar_express_ste
+        from atlas_jax.kernels.triton_pe import triton_polar_express, triton_polar_express_ste
 
         @jax.jit
         def triton_pe_fwd(X):

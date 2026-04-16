@@ -12,7 +12,7 @@ jax.config.update("jax_default_matmul_precision", "float32")
 
 from atlas_jax.config import AtlasConfig
 from atlas_jax.model import Atlas, AtlasMemoryLayer, Block, MLP, rms_norm
-from atlas_jax.polar_express import polar_express, polar_express_ste
+from atlas_jax.memory_layer import polar_express, polar_express_ste
 
 
 def time_fn(fn, *args, warmup=2, repeats=5, **kwargs):

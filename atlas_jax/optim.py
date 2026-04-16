@@ -23,7 +23,7 @@ import jax
 import jax.numpy as jnp
 import optax
 
-from atlas_jax.polar_express import polar_express, POLAR_EXPRESS_COEFFS
+from atlas_jax.memory_layer import polar_express, POLAR_EXPRESS_COEFFS
 
 
 # ---------------------------------------------------------------------------

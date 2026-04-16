@@ -24,7 +24,7 @@ cd /p/project1/westai0047/atlas-jax && source .venv/bin/activate
 echo "==> Nodes: $SLURM_JOB_NODELIST | Tasks: $SLURM_NTASKS | Start: $(date)"
 srun --ntasks=1 nvidia-smi --query-gpu=name,memory.total --format=csv
 
-srun python -m atlas_jax.train_distributed \
+srun python scripts/train_distributed.py \
     --model=mag \
     --n-layer=12 --n-head=12 --n-embd=768 \
     --memory-expand=1 --deep-memory \

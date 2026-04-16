@@ -4,7 +4,7 @@ Makes atlas-jax models compatible with nanochat's evaluation framework
 (CORE metric + BPB). Converts torch↔numpy↔jax at boundaries.
 
 Usage:
-    from atlas_jax.eval_wrapper import load_atlas_for_eval
+    from evals.eval_wrapper import load_atlas_for_eval
     model_wrapper, tokenizer = load_atlas_for_eval(checkpoint_dir, model_type='mag')
     # model_wrapper is callable with nanochat's eval interface
 """

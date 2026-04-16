@@ -24,10 +24,9 @@ import jax.lax as lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from atlas_jax.polar_express import (
-    polar_express_ste, polar_express, POLAR_EXPRESS_COEFFS,
+from atlas_jax.memory_layer import (
+    polar_express_ste, polar_express, POLAR_EXPRESS_COEFFS, DeepMemoryState,
 )
-from atlas_jax.state import DeepMemoryState
 
 
 # ---------------------------------------------------------------------------

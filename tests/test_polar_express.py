@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from atlas_jax.polar_express import polar_express, polar_express_ste
+from atlas_jax.memory_layer import polar_express, polar_express_ste
 
 
 def test_identity_input():

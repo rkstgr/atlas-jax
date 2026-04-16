@@ -22,7 +22,7 @@ echo "==> Start: $(date)"
 
 # Phase 1: Test unrolled + TF32 as baseline, then sweep chunk sizes and hyperparams
 echo "==> Phase 1: Optimization sweep..."
-srun python -m atlas_jax.benchmark --configs \
+srun python scripts/benchmark.py --configs \
     unrolled_tf32 \
     cs128_unrolled_tf32 \
     cs256_unrolled_tf32 \

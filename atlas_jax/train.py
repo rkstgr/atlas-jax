@@ -9,9 +9,10 @@ Data-parallel training via shard_map:
 
 import os
 import sys
-import time
 import math
+import time
 import argparse
+from pathlib import Path
 from functools import partial
 from dataclasses import asdict
 
@@ -27,12 +28,37 @@ from atlas_jax.model import Atlas
 from atlas_jax.data import data_loader
 from atlas_jax.tokenizer import get_tokenizer
 
-# H100 SXM bf16 peak TFLOPS
+
+# ============================================================================
+# Metrics: loss, grad upcasting, FLOPs + BPB accounting
+# ============================================================================
+
+CHARS_PER_TOKEN = 3.3
+BPB_FACTOR = 1.0 / (math.log(2) * CHARS_PER_TOKEN)
+
 GPU_PEAK_TFLOPS = {"H100": 989.4, "RTX8000": 32.6}
 
 
+def loss_fn(model, inputs, targets, *, dropout_key=None):
+    """Standard next-token cross-entropy in nats."""
+    logits, _ = model(inputs, dropout_key=dropout_key)
+    logits_flat = logits.reshape(-1, logits.shape[-1])
+    targets_flat = targets.reshape(-1)
+    log_probs = jax.nn.log_softmax(logits_flat, axis=-1)
+    return -jnp.mean(log_probs[jnp.arange(targets_flat.shape[0]), targets_flat])
+
+
+def upcast_grads(grads):
+    """Cast bf16 gradients to f32 for numerically stable optimizer updates."""
+    def _cast(x):
+        if eqx.is_array(x) and x.dtype == jnp.bfloat16:
+            return x.astype(jnp.float32)
+        return x
+    return jax.tree.map(_cast, grads, is_leaf=eqx.is_array)
+
+
 def estimate_flops_per_token(config, n_params, n_embed_params):
-    """Estimate FLOPs per token (forward + backward = 6N + memory ops)."""
+    """FLOPs per token for Atlas (forward + backward = 6N + memory ops)."""
     H = config.n_head
     D = config.n_embd // H
     E = config.memory_expand * D if config.deep_memory else D
@@ -46,50 +72,82 @@ def estimate_flops_per_token(config, n_params, n_embed_params):
     return 6 * (n_params - n_embed_params) + memory_flops_per_token
 
 
-# ---------------------------------------------------------------------------
-# Train / eval steps
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Checkpointing: atomic save + optional load
+# ============================================================================
 
-def _loss_fn(model, inputs, targets):
-    """Cross-entropy loss (shared by train and eval)."""
-    logits, _ = model(inputs)
-    logits_flat = logits.reshape(-1, logits.shape[-1])
-    targets_flat = targets.reshape(-1)
-    log_probs = jax.nn.log_softmax(logits_flat, axis=-1)
-    return -jnp.mean(log_probs[jnp.arange(targets_flat.shape[0]), targets_flat])
+def _to_cpu(x):
+    """Move a JAX array to CPU for serialization; pass through non-arrays."""
+    if eqx.is_array(x):
+        return jax.device_get(x)
+    return x
 
 
-def _upcast_grads(grads):
-    """Cast bf16 gradients to f32 for numerically stable optimizer updates.
+def save_checkpoint(model, opt_state, step, ckpt_dir, rank=0):
+    """Save model + optimizer state to `ckpt_dir`. No-op if `rank != 0`."""
+    if rank != 0:
+        return
+    ckpt_dir = Path(ckpt_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    Without this, optax.clip_by_global_norm squares bf16 values, which
-    overflows to inf for any gradient > 256 (since 256^2 > bf16 max).
+    model_cpu = jax.tree.map(_to_cpu, model, is_leaf=eqx.is_array)
+    opt_cpu = jax.tree.map(_to_cpu, opt_state, is_leaf=eqx.is_array)
+
+    tmp_model = ckpt_dir / "model.eqx.tmp"
+    tmp_opt = ckpt_dir / "opt_state.eqx.tmp"
+    tmp_meta = ckpt_dir / "meta.tmp"
+
+    eqx.tree_serialise_leaves(str(tmp_model), model_cpu)
+    eqx.tree_serialise_leaves(str(tmp_opt), opt_cpu)
+    with open(tmp_meta, "w") as f:
+        f.write(f"{step}\n")
+
+    tmp_model.rename(ckpt_dir / "model.eqx")
+    tmp_opt.rename(ckpt_dir / "opt_state.eqx")
+    tmp_meta.rename(ckpt_dir / "meta.txt")
+    print(f"[ckpt] Saved step {step} to {ckpt_dir}", flush=True)
+
+
+def load_checkpoint(model, opt_state, ckpt_dir):
+    """Load model + optimizer state from `ckpt_dir`.
+
+    Returns `(model, opt_state, step)`. When no checkpoint is present, returns
+    the inputs unchanged with `step == 0`.
     """
-    def _cast(x):
-        if eqx.is_array(x) and x.dtype == jnp.bfloat16:
-            return x.astype(jnp.float32)
-        return x
-    return jax.tree.map(_cast, grads, is_leaf=eqx.is_array)
+    ckpt_dir = Path(ckpt_dir)
+    model_path = ckpt_dir / "model.eqx"
+    opt_path = ckpt_dir / "opt_state.eqx"
+    meta_path = ckpt_dir / "meta.txt"
 
+    if not model_path.exists():
+        return model, opt_state, 0
+
+    model = eqx.tree_deserialise_leaves(str(model_path), model)
+    opt_state = eqx.tree_deserialise_leaves(str(opt_path), opt_state)
+    with open(meta_path) as f:
+        step = int(f.read().strip())
+
+    print(f"[ckpt] Resumed from step {step} at {ckpt_dir}", flush=True)
+    return model, opt_state, step
+
+
+# ============================================================================
+# Train / eval steps
+# ============================================================================
 
 def make_train_step(mesh):
     """Create train step.
 
     For multi-GPU: uses shard_map to run per-device on local batch shards.
-    shard_map doesn't use vmap, so Triton kernels work. Gradients are
-    averaged via lax.pmean (NCCL all-reduce).
-
     For single-GPU: plain filter_jit (no shard_map overhead).
     """
     n_devices = len(mesh.devices) if mesh is not None else 1
 
     if n_devices > 1:
         def _train_body(model, opt_state, optimizer, inputs, targets):
-            """Per-device train step — sees local batch shard."""
             loss, grads = eqx.filter_value_and_grad(
-                _loss_fn, has_aux=False)(model, inputs, targets)
-            grads = _upcast_grads(grads)
-            # Average gradients across devices
+                loss_fn, has_aux=False)(model, inputs, targets)
+            grads = upcast_grads(grads)
             grads = jax.lax.pmean(grads, axis_name='data')
             loss = jax.lax.pmean(loss, axis_name='data')
             updates, new_opt_state = optimizer.update(grads, opt_state, model)
@@ -98,12 +156,10 @@ def make_train_step(mesh):
 
         @eqx.filter_jit(donate='all')
         def train_step(model, opt_state, optimizer, inputs, targets):
-            # Build partition specs matching the pytree structure
             model_spec = jax.tree.map(lambda _: P(), eqx.filter(model, eqx.is_array))
             opt_spec = jax.tree.map(lambda _: P(), eqx.filter(opt_state, eqx.is_array))
             data_spec = P('data')
 
-            # shard_map: inputs sharded along batch, model/opt replicated
             in_specs = (model_spec, opt_spec, P(), data_spec, data_spec)
             out_specs = (model_spec, opt_spec, P())
 
@@ -120,8 +176,8 @@ def make_train_step(mesh):
         @eqx.filter_jit(donate='all')
         def train_step(model, opt_state, optimizer, inputs, targets):
             loss, grads = eqx.filter_value_and_grad(
-                _loss_fn, has_aux=False)(model, inputs, targets)
-            grads = _upcast_grads(grads)
+                loss_fn, has_aux=False)(model, inputs, targets)
+            grads = upcast_grads(grads)
             updates, new_opt_state = optimizer.update(grads, opt_state, model)
             new_model = eqx.apply_updates(model, updates)
             return new_model, new_opt_state, loss
@@ -135,7 +191,7 @@ def make_eval_step(mesh):
 
     if n_devices > 1:
         def _eval_body(model, inputs, targets):
-            loss = _loss_fn(model, inputs, targets)
+            loss = loss_fn(model, inputs, targets)
             return jax.lax.pmean(loss, axis_name='data')
 
         @eqx.filter_jit
@@ -156,7 +212,7 @@ def make_eval_step(mesh):
     else:
         @eqx.filter_jit
         def eval_step(model, inputs, targets):
-            return _loss_fn(model, inputs, targets)
+            return loss_fn(model, inputs, targets)
 
         return eval_step
 
@@ -213,7 +269,6 @@ def main():
     if n_devices > 1 and args.batch_size % n_devices != 0:
         raise ValueError(f"batch_size={args.batch_size} must be divisible by n_devices={n_devices}")
 
-    # Set up mesh for data parallelism
     if n_devices > 1:
         mesh = Mesh(jax.devices(), axis_names=('data',))
         data_sharding = NamedSharding(mesh, P('data'))
@@ -247,19 +302,10 @@ def main():
     flops_per_token = estimate_flops_per_token(config, n_params, n_embed_params)
     print(f"Parameters: {n_params:,} | FLOPs/token: {flops_per_token:,.0f}")
 
-    # Cast model to bf16 (PE upcasts to f32 internally; logits cast to f32 in model)
     def _to_bf16(x):
         return x.astype(jnp.bfloat16) if eqx.is_array(x) and x.dtype == jnp.float32 else x
     model = jax.tree.map(_to_bf16, model, is_leaf=eqx.is_array)
     print(f"Model cast to bf16")
-
-    # BPB conversion: BPB = loss * (1 / ln(2)) * (tokens / bytes)
-    # For BPE tokenizers, ~3.3 chars/token on average for English text
-    # More precisely: BPB = cross_entropy_nats / ln(2) / chars_per_token
-    # We use the standard approximation: BPB ≈ loss / ln(2) / 3.3
-    # This matches nanochat's convention
-    CHARS_PER_TOKEN = 3.3
-    BPB_FACTOR = 1.0 / (math.log(2) * CHARS_PER_TOKEN)
 
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
@@ -274,7 +320,6 @@ def main():
     )
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
-    # For multi-GPU: replicate model and opt_state across all devices
     if n_devices > 1:
         def _replicate(x):
             return jax.device_put(x, replicate_sharding) if eqx.is_array(x) else x
@@ -286,7 +331,6 @@ def main():
     train_step = make_train_step(mesh)
     eval_step = make_eval_step(mesh)
 
-    # Data
     tokenizer = get_tokenizer(args.tokenizer_dir)
     train_loader = data_loader(
         args.data_dir, tokenizer, args.batch_size, args.seq_len, split='train')
@@ -294,13 +338,12 @@ def main():
         args.data_dir, tokenizer, args.batch_size, args.seq_len, split='val')
 
     tokens_per_step = args.batch_size * args.seq_len
-    gpu_peak_flops = args.gpu_peak_tflops * 1e12 * n_devices  # total across all GPUs
+    gpu_peak_flops = args.gpu_peak_tflops * 1e12 * n_devices
 
-    # Override total_steps if max-tokens is set
     if args.max_tokens > 0:
         max_steps = int(args.max_tokens / tokens_per_step)
         args.total_steps = max_steps
-        print(f"Max tokens: {args.max_tokens:.2e} → {max_steps} steps")
+        print(f"Max tokens: {args.max_tokens:.2e} -> {max_steps} steps")
     if args.target_bpb > 0:
         print(f"Early stopping target: val_bpb <= {args.target_bpb}")
 
@@ -313,18 +356,16 @@ def main():
     print("-" * 80)
 
     def shard_batch(x):
-        """Place batch on devices — sharded along batch dim for multi-GPU."""
         if n_devices > 1:
             return jax.device_put(x, data_sharding)
         return x
 
-    # Warmup compilation with first batch
     print("Compiling train step (first step will be slow)...")
     t_compile = time.time()
     inputs, targets = next(train_loader)
     inputs, targets = shard_batch(inputs), shard_batch(targets)
     model, opt_state, loss = train_step(model, opt_state, optimizer, inputs, targets)
-    float(loss)  # block until done
+    float(loss)
     compile_time = time.time() - t_compile
     print(f"Compilation done in {compile_time:.1f}s | initial loss: {float(loss):.4f}")
     print("-" * 80)
@@ -375,7 +416,6 @@ def main():
 
     training_seconds = time.time() - training_start
 
-    # Final eval
     print("-" * 80)
     print("Final evaluation...")
     val_losses = []
@@ -389,7 +429,6 @@ def main():
     total_seconds = time.time() - training_start
     total_tokens = step * tokens_per_step
 
-    # Compute average MFU
     warmup_skip = min(5, len(step_times))
     if len(step_times) > warmup_skip:
         avg_dt = sum(step_times[warmup_skip:]) / len(step_times[warmup_skip:])

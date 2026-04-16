@@ -122,18 +122,12 @@ def main():
           f"batch={args.batch_size}, accum={args.grad_accum}, seq_len={args.seq_len}")
     print(f"Fused: {args.fused_chunk}, bf16: {args.bf16}")
 
-    # Optimizer: AdamW with gradient clipping and cosine decay
-    warmup = min(100, args.num_batches // 2)
-    schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0,
-        peak_value=args.lr,
-        warmup_steps=warmup,
-        decay_steps=max(args.num_batches, warmup + 1),
-        end_value=args.lr * 0.1,
-    )
+    # Optimizer: AdamW with gradient clipping
+    # Match PyTorch exactly: flat LR, betas=(0.9, 0.99)
     optimizer = optax.chain(
         optax.clip_by_global_norm(args.grad_clip),
-        optax.adamw(learning_rate=schedule, weight_decay=args.weight_decay),
+        optax.adamw(learning_rate=args.lr, b1=0.9, b2=0.99,
+                    weight_decay=args.weight_decay),
     )
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 

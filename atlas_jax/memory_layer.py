@@ -511,18 +511,46 @@ class AtlasMemoryLayer(eqx.Module):
         with jax.named_scope("mem_fwd"):
             h = jnp.einsum('bhed,bchd->bche', W2, k_c)
             act = jax.nn.gelu(h)
-            y_pred = k_c + jnp.einsum('bhde,bche->bchd', W1, act)
+            z = jnp.einsum('bhde,bche->bchd', W1, act)
+            if self.residual_norm:
+                # Internal ResidualNorm: LN(MLP(k)) + k — matches PyTorch
+                eps = 1e-5
+                z_mean = z.mean(axis=-1, keepdims=True)
+                z_var = z.var(axis=-1, keepdims=True)
+                z_sigma = jnp.sqrt(z_var + eps)
+                z_hat = (z - z_mean) / z_sigma
+                z_normed = z_hat * (self.ln_gamma + 1.0)
+                y_pred = z_normed + k_c
+            else:
+                y_pred = k_c + z
             err = y_pred - v_c
 
         with jax.named_scope("mem_grad"):
             orig_dtype = err.dtype
             err_f = err.astype(jnp.float32)
+            if self.residual_norm:
+                # Backprop err through LayerNorm Jacobian:
+                # dz = (gamma+1)/sigma * (err - mean(err_g) - z_hat * mean(z_hat * err_g))
+                # where err_g = err * (gamma+1)
+                gamma_p1 = (self.ln_gamma + 1.0).astype(jnp.float32)
+                err_g = err_f * gamma_p1
+                z_hat_f = z_hat.astype(jnp.float32)
+                z_sigma_f = z_sigma.astype(jnp.float32)
+                n = z.shape[-1]
+                err_ln = (1.0 / z_sigma_f) * (
+                    err_g
+                    - err_g.mean(axis=-1, keepdims=True)
+                    - z_hat_f * (z_hat_f * err_g).mean(axis=-1, keepdims=True)
+                )
+                grad_err = err_ln
+            else:
+                grad_err = err_f
             act_f = act.astype(jnp.float32)
             D = k_c.shape[-1]
             scale = 2.0 / D
-            u_W1 = (scale * jnp.einsum('bchd,bche->bchde', err_f, act_f)).astype(orig_dtype)
+            u_W1 = (scale * jnp.einsum('bchd,bche->bchde', grad_err, act_f)).astype(orig_dtype)
             gelu_prime = _gelu_derivative(h)
-            w1t_err = jnp.einsum('bhde,bchd->bche', W1.astype(jnp.float32), err_f)
+            w1t_err = jnp.einsum('bhde,bchd->bche', W1.astype(jnp.float32), grad_err)
             chain = w1t_err * gelu_prime
             u_W2 = (scale * jnp.einsum('bche,bchd->bched', chain, k_c.astype(jnp.float32))).astype(orig_dtype)
 
@@ -599,7 +627,15 @@ class AtlasMemoryLayer(eqx.Module):
         with jax.named_scope("mem_output"):
             h_q = jnp.einsum('bched,bchd->bche', W2_all, q_c)
             g_q = jax.nn.gelu(h_q)
-            y_c = q_c + jnp.einsum('bchde,bche->bchd', W1_all, g_q)
+            z_q = jnp.einsum('bchde,bche->bchd', W1_all, g_q)
+            if self.residual_norm:
+                eps = 1e-5
+                zq_mean = z_q.mean(axis=-1, keepdims=True)
+                zq_var = z_q.var(axis=-1, keepdims=True)
+                z_q_hat = (z_q - zq_mean) / jnp.sqrt(zq_var + eps)
+                y_c = z_q_hat * (self.ln_gamma + 1.0) + q_c
+            else:
+                y_c = q_c + z_q
 
         return y_c, DeepMemoryState(W1=W1, W2=W2, S_W1=S_W1, S_W2=S_W2)
 
@@ -730,14 +766,6 @@ class AtlasMemoryLayer(eqx.Module):
             y = jnp.transpose(all_y, (1, 0, 2, 3, 4)).reshape(B, T, H, D)
 
         y = y[:, :T_orig]
-
-        # ResidualNorm: LayerNorm(y) * (gamma+1) + y  (per-head, like PyTorch's ResidualNorm)
-        if self.residual_norm:
-            eps = 1e-5
-            mean = y.mean(axis=-1, keepdims=True)
-            var = y.var(axis=-1, keepdims=True)
-            y_normed = (y - mean) / jnp.sqrt(var + eps)
-            y = y_normed * (self.ln_gamma + 1.0) + y
 
         if self.retrieve_gate is not None:
             gate = jax.nn.sigmoid(x @ self.retrieve_gate.weight.T)

@@ -22,6 +22,13 @@ from pathlib import Path
 
 BASE_DIR = Path("/p/project1/westai0047")
 
+# Each repo has its own venv — use the correct Python for each
+PYTHON = {
+    "pytorch": str(BASE_DIR / "atlas-pytorch/.venv/bin/python"),
+    "rnn":     str(BASE_DIR / "atlas-rnn/.venv/bin/python"),
+    "jax":     str(BASE_DIR / "atlas-jax/.venv/bin/python"),
+}
+
 # Common config for fair comparison
 COMMON = dict(
     dim=256,
@@ -31,9 +38,9 @@ COMMON = dict(
     omega_window=2,
     poly_degree=2,
     poly_mode="elementwise",
-    batch_size=4,
+    batch_size=16,
     seq_len=512,
-    grad_accum=4,
+    grad_accum=1,
     lr=2e-4,
     weight_decay=0.01,
     grad_clip=0.5,
@@ -44,15 +51,21 @@ COMMON = dict(
     seed=42,
 )
 
+# Per-run config overrides (PyTorch OOMs at batch=16 due to vmap(grad))
+RUN_OVERRIDES = {
+    "pytorch-base": {"batch_size": 4, "grad_accum": 4},
+    "pytorch-fast": {"batch_size": 4, "grad_accum": 4},
+}
+
 # Run definitions: each has a name, working dir, command template
+# All use Atlas/LMM architecture (pure memory, no attention) for fair comparison
 RUNS = {
     "pytorch-base": {
         "impl": "pytorch",
         "mode": "base",
         "cwd": BASE_DIR / "atlas-pytorch",
         "cmd": [
-            sys.executable, "train_mag.py",
-            "--model", "omeganet",
+            "__PYTHON__", "train_atlas.py",
             "--dim", "{dim}", "--depth", "{depth}",
             "--heads", "{heads}", "--dim-head", "{dim_head}",
             "--omega-window", "{omega_window}",
@@ -78,8 +91,7 @@ RUNS = {
         "mode": "fast",
         "cwd": BASE_DIR / "atlas-pytorch",
         "cmd": [
-            sys.executable, "train_mag.py",
-            "--model", "omeganet",
+            "__PYTHON__", "train_atlas.py",
             "--dim", "{dim}", "--depth", "{depth}",
             "--heads", "{heads}", "--dim-head", "{dim_head}",
             "--omega-window", "{omega_window}",
@@ -105,8 +117,8 @@ RUNS = {
         "mode": "base",
         "cwd": BASE_DIR / "atlas-rnn",
         "cmd": [
-            sys.executable, "train_rnn_transformer.py",
-            "--arch", "mag",
+            "__PYTHON__", "train_rnn_transformer.py",
+            "--arch", "lmm",
             "--model", "omeganet",
             "--dim", "{dim}", "--depth", "{depth}",
             "--heads", "{heads}", "--dim-head", "{dim_head}",
@@ -131,7 +143,7 @@ RUNS = {
         "mode": "base",
         "cwd": BASE_DIR / "atlas-jax",
         "cmd": [
-            sys.executable, "scripts/train_enwik8.py",
+            "__PYTHON__", "-m", "scripts.train_enwik8",
             "--model", "lmm",
             "--dim", "{dim}", "--depth", "{depth}",
             "--heads", "{heads}", "--dim-head", "{dim_head}",
@@ -157,7 +169,7 @@ RUNS = {
         "mode": "fused",
         "cwd": BASE_DIR / "atlas-jax",
         "cmd": [
-            sys.executable, "scripts/train_enwik8.py",
+            "__PYTHON__", "-m", "scripts.train_enwik8",
             "--model", "lmm",
             "--dim", "{dim}", "--depth", "{depth}",
             "--heads", "{heads}", "--dim-head", "{dim_head}",
@@ -185,10 +197,14 @@ RUNS = {
 def run_benchmark(name, run_def, config, results_dir):
     """Run a single benchmark configuration as a subprocess."""
     metrics_file = results_dir / f"{name}.jsonl"
-    config_with_file = {**config, "metrics_file": str(metrics_file)}
+    run_config = {**config, **RUN_OVERRIDES.get(name, {})}
+    config_with_file = {**run_config, "metrics_file": str(metrics_file)}
 
-    # Format command with config values
-    cmd = [str(c).format(**config_with_file) for c in run_def["cmd"]]
+    # Format command with config values, substitute correct Python per impl
+    impl = run_def["impl"]
+    python_bin = PYTHON[impl]
+    cmd = [str(c).format(**config_with_file).replace("__PYTHON__", python_bin)
+           for c in run_def["cmd"]]
     cwd = run_def["cwd"]
 
     print(f"\n{'='*70}")
@@ -200,7 +216,9 @@ def run_benchmark(name, run_def, config, results_dir):
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
-    # JAX needs this for f32 matmuls (set in the script itself, but belt-and-suspenders)
+    # Avoid disk quota issues from Triton/CUDA kernel compilation in home dir
+    env.setdefault("TMPDIR", "/tmp")
+    env.setdefault("TORCH_EXTENSIONS_DIR", "/tmp/torch_extensions")
     if run_def["impl"] == "jax":
         env.setdefault("TIKTOKEN_CACHE_DIR", "/p/project1/westai0047/tiktoken_cache")
 

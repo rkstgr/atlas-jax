@@ -115,11 +115,12 @@ def main():
     print(f"Fused: {args.fused_chunk}, bf16: {args.bf16}")
 
     # Optimizer: AdamW with gradient clipping and cosine decay
+    warmup = min(100, args.num_batches // 2)
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=args.lr,
-        warmup_steps=100,
-        decay_steps=args.num_batches,
+        warmup_steps=warmup,
+        decay_steps=max(args.num_batches, warmup + 1),
         end_value=args.lr * 0.1,
     )
     optimizer = optax.chain(

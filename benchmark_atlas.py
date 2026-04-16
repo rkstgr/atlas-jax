@@ -38,7 +38,7 @@ COMMON = dict(
     omega_window=2,
     poly_degree=2,
     poly_mode="elementwise",
-    batch_size=16,
+    batch_size=8,
     seq_len=512,
     grad_accum=1,
     lr=2e-4,
@@ -51,10 +51,8 @@ COMMON = dict(
     seed=42,
 )
 
-# Per-run config overrides (PyTorch OOMs at batch=16 due to vmap(grad))
+# Per-run config overrides
 RUN_OVERRIDES = {
-    "pytorch-base": {"batch_size": 4, "grad_accum": 4},
-    "pytorch-fast": {"batch_size": 4, "grad_accum": 4},
 }
 
 # Run definitions: each has a name, working dir, command template
@@ -86,32 +84,8 @@ RUNS = {
             "--metrics-file", "{metrics_file}",
         ],
     },
-    "pytorch-fast": {
-        "impl": "pytorch",
-        "mode": "fast",
-        "cwd": BASE_DIR / "atlas-pytorch",
-        "cmd": [
-            "__PYTHON__", "train_atlas.py",
-            "--dim", "{dim}", "--depth", "{depth}",
-            "--heads", "{heads}", "--dim-head", "{dim_head}",
-            "--omega-window", "{omega_window}",
-            "--poly-mode", "{poly_mode}", "--poly-degree", "{poly_degree}",
-            "--batch-size", "{batch_size}", "--seq-len", "{seq_len}",
-            "--grad-accum", "{grad_accum}",
-            "--learning-rate", "{lr}",
-            "--weight-decay", "{weight_decay}",
-            "--grad-clip", "{grad_clip}",
-            "--num-batches", "{num_batches}",
-            "--validate-every", "{validate_every}",
-            "--eval-steps", "{eval_steps}",
-            "--warmup-steps", "{warmup_steps}",
-            "--seed", "{seed}",
-            # accelerated_scan ON (default)
-            "--force-f32",
-            "--no-generate",
-            "--metrics-file", "{metrics_file}",
-        ],
-    },
+    # pytorch-fast disabled: accelerated_scan warpscan kernel crashes with
+    # illegal memory access on AtlasLMM at batch>=8. Upstream bug.
     "rnn-base": {
         "impl": "rnn",
         "mode": "base",

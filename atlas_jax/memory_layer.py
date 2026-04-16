@@ -350,10 +350,10 @@ class AtlasMemoryLayer(eqx.Module):
     c_v: eqx.nn.Linear
     c_proj: eqx.nn.Linear
 
-    # Short causal convolutions
-    conv_q: ShortConv
-    conv_k: ShortConv
-    conv_v: ShortConv
+    # Short causal convolutions (None if conv_kernel=0)
+    conv_q: ShortConv | None
+    conv_k: ShortConv | None
+    conv_v: ShortConv | None
 
     # Gates
     gate_alpha: eqx.nn.Linear
@@ -388,6 +388,7 @@ class AtlasMemoryLayer(eqx.Module):
     fused_chunk: bool = eqx.field(static=True)
     max_lr: float = eqx.field(static=True)
     stop_grad_chunks: bool = eqx.field(static=True)
+    residual_norm: bool = eqx.field(static=True)
 
     def __init__(self, config: AtlasConfig, *, key):
         keys = jax.random.split(key, 14)
@@ -408,6 +409,7 @@ class AtlasMemoryLayer(eqx.Module):
         self.use_checkpoint = config.use_checkpoint
         self.max_lr = config.max_lr
         self.stop_grad_chunks = config.stop_grad_chunks
+        self.residual_norm = config.residual_norm
         _d_is_pow2 = (D & (D - 1) == 0)
         _e_is_pow2 = (E & (E - 1) == 0)
         self.fused_chunk = config.fused_chunk and HAS_FUSED_CHUNK and _d_is_pow2 and _e_is_pow2
@@ -424,9 +426,14 @@ class AtlasMemoryLayer(eqx.Module):
         self.c_v = eqx.nn.Linear(C, dim_inner, use_bias=False, key=keys[2])
         self.c_proj = eqx.nn.Linear(dim_inner, C, use_bias=False, key=keys[3])
 
-        self.conv_q = ShortConv(dim_inner, config.conv_kernel, key=keys[4])
-        self.conv_k = ShortConv(dim_inner, config.conv_kernel, key=keys[5])
-        self.conv_v = ShortConv(dim_inner, config.conv_kernel, key=keys[6])
+        if config.conv_kernel > 0:
+            self.conv_q = ShortConv(dim_inner, config.conv_kernel, key=keys[4])
+            self.conv_k = ShortConv(dim_inner, config.conv_kernel, key=keys[5])
+            self.conv_v = ShortConv(dim_inner, config.conv_kernel, key=keys[6])
+        else:
+            self.conv_q = None
+            self.conv_k = None
+            self.conv_v = None
 
         self.gate_alpha = eqx.nn.Linear(C, H, use_bias=True, key=keys[7])
         self.gate_eta = eqx.nn.Linear(C, H, use_bias=True, key=keys[8])
@@ -604,9 +611,16 @@ class AtlasMemoryLayer(eqx.Module):
         dim_inner = H * D
 
         with jax.named_scope("qkv_proj"):
-            q = self.conv_q((x @ self.c_q.weight.T).reshape(B, T, dim_inner)).reshape(B, T, H, D)
-            k = self.conv_k((x @ self.c_k.weight.T).reshape(B, T, dim_inner)).reshape(B, T, H, D)
-            v = self.conv_v((x @ self.c_v.weight.T).reshape(B, T, dim_inner)).reshape(B, T, H, D)
+            q_proj = (x @ self.c_q.weight.T).reshape(B, T, dim_inner)
+            k_proj = (x @ self.c_k.weight.T).reshape(B, T, dim_inner)
+            v_proj = (x @ self.c_v.weight.T).reshape(B, T, dim_inner)
+            if self.conv_q is not None:
+                q_proj = self.conv_q(q_proj)
+                k_proj = self.conv_k(k_proj)
+                v_proj = self.conv_v(v_proj)
+            q = q_proj.reshape(B, T, H, D)
+            k = k_proj.reshape(B, T, H, D)
+            v = v_proj.reshape(B, T, H, D)
 
         with jax.named_scope("qk_norm_poly"):
             if self.poly_degree > 0:
@@ -716,6 +730,14 @@ class AtlasMemoryLayer(eqx.Module):
             y = jnp.transpose(all_y, (1, 0, 2, 3, 4)).reshape(B, T, H, D)
 
         y = y[:, :T_orig]
+
+        # ResidualNorm: LayerNorm(y) * (gamma+1) + y  (per-head, like PyTorch's ResidualNorm)
+        if self.residual_norm:
+            eps = 1e-5
+            mean = y.mean(axis=-1, keepdims=True)
+            var = y.var(axis=-1, keepdims=True)
+            y_normed = (y - mean) / jnp.sqrt(var + eps)
+            y = y_normed * (self.ln_gamma + 1.0) + y
 
         if self.retrieve_gate is not None:
             gate = jax.nn.sigmoid(x @ self.retrieve_gate.weight.T)

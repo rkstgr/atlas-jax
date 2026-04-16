@@ -50,6 +50,12 @@ def main():
                         help='Mixed precision: bf16 model weights, f32 optimizer')
     parser.add_argument('--fused-chunk', action='store_true', default=False,
                         help='Use fused Triton kernel')
+    parser.add_argument('--residual-norm', action='store_true', default=False,
+                        help='ResidualNorm on memory output (matches PyTorch)')
+    parser.add_argument('--conv-kernel', type=int, default=4,
+                        help='Causal conv kernel size (0 = disabled)')
+    parser.add_argument('--persist-mem', type=int, default=None,
+                        help='Persistent memory tokens (default: 4 for lmm, 0 for mag)')
     parser.add_argument('--model', type=str, default='lmm', choices=['lmm', 'mag'],
                         help='Architecture: lmm (memory only) or mag (memory + attention)')
     parser.add_argument('--window-size', type=int, default=64,
@@ -83,13 +89,15 @@ def main():
         pe_ste=True,
         use_checkpoint=True,
         fused_chunk=args.fused_chunk,
+        residual_norm=args.residual_norm,
+        conv_kernel=args.conv_kernel,
         dropout=0.0,
         gate_bias_init=0.0,
         max_lr=0.1,
         logit_softcap=0.0,
         stop_grad_chunks=args.stop_grad_chunks,
         geglu_ff=True,
-        num_persist_mem_tokens=4 if args.model == 'lmm' else 0,
+        num_persist_mem_tokens=args.persist_mem if args.persist_mem is not None else (4 if args.model == 'lmm' else 0),
         window_size=args.window_size,
         neural_memory_layers=tuple(int(x) for x in args.memory_layers.split(',')) if args.memory_layers else None,
     )

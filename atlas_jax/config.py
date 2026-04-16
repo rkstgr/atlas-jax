@@ -12,7 +12,8 @@ class AtlasConfig:
     n_embd: int = 1536
     dim_head: int | None = None  # per-head dim; if None, n_embd // n_head
     chunk_size: int = 64       # tokens per chunk for parallel memory computation
-    conv_kernel: int = 4       # short causal convolution kernel size
+    conv_kernel: int = 4       # short causal convolution kernel size (0 = disabled)
+    residual_norm: bool = False # ResidualNorm on memory output (PyTorch has this, we don't by default)
     ns_steps: int = 5          # Polar Express orthogonalization iterations
     omega_window: int = 16     # Omega rule sliding window size (1 = online/Delta rule)
     poly_degree: int = 2       # polynomial feature mapping degree (0 = disabled)

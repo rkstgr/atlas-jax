@@ -1,9 +1,12 @@
 """Enwik8 training script for atlas-jax — matches atlas_pytorch/train_atlas.py.
 
 Single-GPU, f32, AdamW. For verifying JAX matches PyTorch on enwik8.
+
+Benchmark mode: writes JSONL metrics to --metrics-file for cross-impl comparison.
 """
 
 import argparse
+import json
 import math
 import time
 
@@ -53,6 +56,11 @@ def main():
                         help='Sliding window size for MAG attention')
     parser.add_argument('--memory-layers', type=str, default=None,
                         help='Comma-separated layer indices for memory (MAG only, e.g. "1,3,5,7")')
+    # Benchmark
+    parser.add_argument('--metrics-file', type=str, default=None,
+                        help='Path to write JSONL metrics (one JSON object per step)')
+    parser.add_argument('--warmup-steps', type=int, default=10,
+                        help='Steps excluded from timing/memory metrics')
     args = parser.parse_args()
 
     jax.config.update("jax_default_matmul_precision", "high" if args.bf16 else "float32")
@@ -102,6 +110,9 @@ def main():
     print(f"Parameters: {n_params:,} ({n_params/1e6:.1f}M)")
     print(f"Config: dim={args.dim}, depth={args.depth}, heads={args.heads}, "
           f"dim_head={args.dim_head}, expand={args.memory_expand}")
+    print(f"Training: lr={args.lr}, grad_clip={args.grad_clip}, "
+          f"batch={args.batch_size}, accum={args.grad_accum}, seq_len={args.seq_len}")
+    print(f"Fused: {args.fused_chunk}, bf16: {args.bf16}")
 
     # Optimizer: AdamW with gradient clipping and cosine decay
     schedule = optax.warmup_cosine_decay_schedule(
@@ -157,6 +168,35 @@ def main():
             total_loss += float(loss)
         return model, opt_state, total_loss / accum_steps
 
+    # Metrics file
+    metrics_fh = None
+    if args.metrics_file:
+        metrics_fh = open(args.metrics_file, 'w')
+
+    def write_metric(record):
+        if metrics_fh:
+            metrics_fh.write(json.dumps(record) + '\n')
+            metrics_fh.flush()
+
+    mode = "base"
+    if args.fused_chunk:
+        mode = "fused"
+
+    write_metric({
+        "type": "config",
+        "impl": "jax",
+        "mode": mode,
+        "n_params": n_params,
+        "dim": args.dim, "depth": args.depth, "heads": args.heads,
+        "dim_head": args.dim_head, "omega_window": args.omega_window,
+        "memory_expand": args.memory_expand,
+        "poly_degree": args.poly_degree,
+        "batch_size": args.batch_size, "seq_len": args.seq_len,
+        "grad_accum": args.grad_accum, "lr": args.lr,
+        "grad_clip": args.grad_clip, "weight_decay": args.weight_decay,
+        "fused_chunk": args.fused_chunk, "bf16": args.bf16,
+    })
+
     # Warmup compilation
     print("Compiling...")
     t0 = time.time()
@@ -164,9 +204,10 @@ def main():
     model, opt_state, loss = train_step(model, opt_state, inputs, targets)
     float(loss)  # block
     print(f"Compilation done in {time.time()-t0:.1f}s | initial loss: {float(loss):.4f}")
-    print("-" * 60)
+    print("-" * 70)
 
     bpb_factor = 1.0 / math.log(2)  # nats to bits (byte-level, 1 char = 1 byte)
+    total_start = time.time()
 
     for step in range(1, args.num_batches + 1):
         t0 = time.time()
@@ -175,10 +216,42 @@ def main():
         dt = time.time() - t0
         bpb = avg_loss * bpb_factor
 
+        tokens_this_step = args.batch_size * args.seq_len * args.grad_accum
+        tok_s = tokens_this_step / dt
+
+        # JAX memory stats
+        peak_mem_mb = 0.0
+        if step == args.warmup_steps or step == args.warmup_steps + 1:
+            try:
+                backend = jax.local_devices()[0]
+                mem_stats = backend.memory_stats()
+                if mem_stats:
+                    peak_mem_mb = mem_stats.get('peak_bytes_in_use', 0) / (1024 ** 2)
+            except Exception:
+                pass
+
         if step % 10 == 0 or step <= 5:
-            tps = args.batch_size * args.seq_len * args.grad_accum / dt
+            # Get memory on log steps too
+            try:
+                backend = jax.local_devices()[0]
+                mem_stats = backend.memory_stats()
+                if mem_stats:
+                    peak_mem_mb = mem_stats.get('peak_bytes_in_use', 0) / (1024 ** 2)
+            except Exception:
+                pass
             print(f"step {step:5d} | loss {avg_loss:.4f} | bpb {bpb:.4f} | "
-                  f"{dt:.1f}s | {tps:.0f} tok/s")
+                  f"{dt*1000:.0f}ms | {tok_s:.0f} tok/s | mem {peak_mem_mb:.0f}MB")
+
+        if step > args.warmup_steps:
+            write_metric({
+                "type": "step",
+                "step": step,
+                "loss": avg_loss,
+                "bpb": bpb,
+                "step_time_ms": dt * 1000,
+                "tok_s": tok_s,
+                "peak_mem_mb": peak_mem_mb,
+            })
 
         if step % args.validate_every == 0:
             # Validation
@@ -190,8 +263,25 @@ def main():
             val_loss = sum(val_losses) / len(val_losses)
             val_bpb = val_loss * bpb_factor
             print(f"  >>> EVAL | val_loss {val_loss:.4f} | val_bpb {val_bpb:.4f}")
+            write_metric({
+                "type": "eval",
+                "step": step,
+                "val_loss": val_loss,
+                "val_bpb": val_bpb,
+            })
 
-    print("Done.")
+    total_time = time.time() - total_start
+    total_tokens = args.batch_size * args.seq_len * args.grad_accum * args.num_batches
+    write_metric({
+        "type": "summary",
+        "total_time_s": total_time,
+        "total_tokens": total_tokens,
+        "total_steps": args.num_batches,
+    })
+
+    print(f"\nDone. Total time: {total_time:.1f}s, tokens: {total_tokens:,}")
+    if metrics_fh:
+        metrics_fh.close()
 
 
 if __name__ == "__main__":

@@ -4,10 +4,10 @@ Consolidates profile_layer.py, profile_sweep.py, profile_headdim.py,
 profile_singlechunk.py into one structured tool.
 
 Usage:
-    python -m atlas_jax.profile                    # laptop defaults (CPU-safe)
-    python -m atlas_jax.profile --preset h100      # H100 target config
-    python -m atlas_jax.profile --json out.json    # structured JSON output
-    python -m atlas_jax.profile --n-embd 256       # custom overrides
+    python scripts/profile.py                    # laptop defaults (CPU-safe)
+    python scripts/profile.py --preset h100      # H100 target config
+    python scripts/profile.py --json out.json    # structured JSON output
+    python scripts/profile.py --n-embd 256       # custom overrides
 """
 
 import argparse
@@ -25,7 +25,7 @@ from atlas_jax.model import (
     Atlas, AtlasMemoryLayer, Block, MLP, ShortConv,
     linear_scan, rms_norm,
 )
-from atlas_jax.polar_express import polar_express, polar_express_ste
+from atlas_jax.memory_layer import polar_express, polar_express_ste
 
 
 # ---------------------------------------------------------------------------

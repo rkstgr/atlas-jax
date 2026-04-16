@@ -20,10 +20,10 @@ echo "==> $(hostname) | $(nvidia-smi --query-gpu=name --format=csv,noheader)"
 
 echo ""
 echo "=== TF32 precision ==="
-srun python -m atlas_jax.profile_pe --matmul-precision high
+srun python scripts/profile_pe.py --matmul-precision high
 
 echo ""
 echo "=== f32 precision ==="
-srun python -m atlas_jax.profile_pe --matmul-precision float32
+srun python scripts/profile_pe.py --matmul-precision float32
 
 echo "==> Done $(date)"

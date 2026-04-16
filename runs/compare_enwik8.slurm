@@ -22,7 +22,7 @@ echo "==> GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 
 echo "==> Start: $(date)"
 
 echo "=== Full alignment: ResidualNorm + persist_mem=4 + retrieve_gate, stop_grad=True ==="
-python -m atlas_jax.train_enwik8 \
+python scripts/train_enwik8.py \
     --dim=320 --depth=8 --heads=4 --dim-head=64 \
     --memory-expand=2 --poly-degree=2 --omega-window=2 \
     --chunk-size=64 --ns-steps=5 \

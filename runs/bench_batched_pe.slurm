@@ -30,7 +30,7 @@ python -m pytest tests/ -x -q --tb=short 2>&1 || {
 # Compare baseline vs batched (batched is now the default when D==E)
 echo ""
 echo "==> Benchmark comparison..."
-srun python -m atlas_jax.benchmark --configs \
+srun python scripts/benchmark.py --configs \
     baseline \
     baseline_tf32 \
     cs256 \

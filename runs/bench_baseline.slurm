@@ -22,7 +22,7 @@ echo "==> JAX version: $(python -c 'import jax; print(jax.__version__)')"
 echo "==> Start: $(date)"
 
 # Run baseline + key single-variable comparisons
-srun python -m atlas_jax.benchmark --configs \
+srun python scripts/benchmark.py --configs \
     baseline \
     baseline_tf32 \
     unrolled \

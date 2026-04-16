@@ -24,7 +24,7 @@ cd /p/project1/westai0047/atlas-jax && source .venv/bin/activate
 echo "==> Option A: jax.distributed on $(hostname), $SLURM_NTASKS tasks"
 nvidia-smi --query-gpu=name,memory.total --format=csv
 
-srun python -m atlas_jax.train_distributed \
+srun python scripts/train_distributed.py \
     --n-layer=8 --n-head=8 --n-embd=512 \
     --memory-expand=1 --deep-memory \
     --poly-degree=3 --omega-window=16 --chunk-size=64 \

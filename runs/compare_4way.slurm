@@ -48,7 +48,7 @@ case $TASK in
 1)
     echo "=== JAX MAG (f32, nonfused) ==="
     cd /p/project1/westai0047/atlas-jax && source .venv/bin/activate
-    python -m atlas_jax.train_enwik8 \
+    python scripts/train_enwik8.py \
         --model=mag \
         --dim=256 --depth=8 --heads=4 --dim-head=64 \
         --memory-expand=2 --poly-degree=2 --omega-window=2 \
@@ -62,7 +62,7 @@ case $TASK in
 2)
     echo "=== JAX MAG (f32, fused) ==="
     cd /p/project1/westai0047/atlas-jax && source .venv/bin/activate
-    python -m atlas_jax.train_enwik8 \
+    python scripts/train_enwik8.py \
         --model=mag \
         --dim=256 --depth=8 --heads=4 --dim-head=64 \
         --memory-expand=2 --poly-degree=2 --omega-window=2 \
@@ -76,7 +76,7 @@ case $TASK in
 3)
     echo "=== JAX MAG (bf16, fused) ==="
     cd /p/project1/westai0047/atlas-jax && source .venv/bin/activate
-    python -m atlas_jax.train_enwik8 \
+    python scripts/train_enwik8.py \
         --model=mag \
         --dim=256 --depth=8 --heads=4 --dim-head=64 \
         --memory-expand=2 --poly-degree=2 --omega-window=2 \

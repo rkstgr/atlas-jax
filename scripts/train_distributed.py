@@ -5,7 +5,7 @@ Each SLURM task = 1 process = 1 GPU. Triton kernels run in single-device
 context (no vmap/pmap), gradients are synced via shard_map + lax.pmean
 over the multi-process mesh.
 
-Launch: srun --ntasks=N --gres=gpu:N python -m atlas_jax.train_distributed [args]
+Launch: srun --ntasks=N --gres=gpu:N python scripts/train_distributed.py [args]
 """
 
 import os
@@ -41,9 +41,9 @@ import optax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.experimental.shard_map import shard_map
 
-from atlas_jax.checkpoint import save_checkpoint, load_checkpoint
+from atlas_jax.train import save_checkpoint, load_checkpoint
 from atlas_jax.config import AtlasConfig
-from atlas_jax.metrics import (
+from atlas_jax.train import (
     BPB_FACTOR,
     estimate_flops_per_token,
     loss_fn as _loss_fn,

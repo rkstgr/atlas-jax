@@ -16,7 +16,7 @@ import optax
 
 from atlas_jax.config import AtlasConfig
 from atlas_jax.model import Atlas
-from atlas_jax.enwik8 import enwik8_data_loader
+from scripts.enwik8 import enwik8_data_loader
 
 
 def main():

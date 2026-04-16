@@ -23,7 +23,7 @@ echo "==> Start time: $(date)"
 
 # Run the profiler with H100 preset, save JSON + JAX trace
 TRACE_DIR="/p/scratch/westai0047/nanochat/logs/atlas_trace_h100"
-srun python -m atlas_jax.profile --preset h100 \
+srun python scripts/profile.py --preset h100 \
     --json /p/scratch/westai0047/nanochat/logs/atlas_profile_h100.json \
     --trace "$TRACE_DIR"
 

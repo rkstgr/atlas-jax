@@ -36,7 +36,7 @@ echo "==> MASTER_ADDR: $MASTER_ADDR"
 srun --ntasks=1 nvidia-smi --query-gpu=name,memory.total --format=csv
 
 echo "==> Starting Atlas 170M paper-faithful training (4×H100, fused kernel)..."
-srun python -m atlas_jax.train_distributed \
+srun python scripts/train_distributed.py \
     --n-layer=12 --n-head=12 --n-embd=768 \
     --memory-expand=1 --deep-memory \
     --poly-degree=2 --omega-window=16 --chunk-size=64 \

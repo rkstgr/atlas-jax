@@ -16,7 +16,7 @@ import equinox as eqx
 
 from atlas_jax.config import AtlasConfig
 from atlas_jax.model import AtlasMemoryLayer, MLP, rms_norm, _dropout
-from atlas_jax.attention import SlidingWindowAttention
+from atlas_jax.model import SlidingWindowAttention
 
 
 class MemoryGate(eqx.Module):

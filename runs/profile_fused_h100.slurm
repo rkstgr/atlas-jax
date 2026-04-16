@@ -32,7 +32,7 @@ python -m pytest tests/test_fused_chunk.py -v --tb=short 2>&1 || {
 echo ""
 echo "==> Running profile comparison..."
 TRACE_DIR="/p/scratch/westai0047/nanochat/logs/flash_atlas_trace"
-srun python -m atlas_jax.profile_fused --preset h100 \
+srun python scripts/profile_fused.py --preset h100 \
     --trace-dir "$TRACE_DIR"
 
 echo ""

@@ -5,7 +5,7 @@ Inserts a "needle" (a random fact) at various depths in a "haystack" (filler tex
 then queries the model to retrieve it.
 
 Usage:
-    python -m atlas_jax.eval_niah --checkpoint /path/to/ckpt --model mag --context-lengths 512,1024,2048,4096
+    python evals/eval_niah.py --checkpoint /path/to/ckpt --model mag --context-lengths 512,1024,2048,4096
 """
 
 import argparse

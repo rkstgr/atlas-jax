@@ -24,7 +24,7 @@ def main():
     print("=" * 80)
 
     from atlas_jax.model import linear_scan as assoc_scan
-    from atlas_jax.triton_scan import triton_linear_scan
+    from atlas_jax.kernels.triton_scan import triton_linear_scan
 
     for label, B, T, H, D, E in [
         ("small",  8, 64, 8, 56, 56),   # Paper config per chunk

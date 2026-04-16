@@ -4,8 +4,8 @@ Uses jax.profiler.trace to produce a Perfetto-compatible trace.
 Fused config: memory_expand=1, ns_steps=3, pe_ste=True, fused_chunk=True.
 
 Usage:
-    python -m atlas_jax.profile_train                          # auto-detect GPU
-    python -m atlas_jax.profile_train --trace-dir /tmp/trace   # custom output dir
+    python scripts/profile_train.py                          # auto-detect GPU
+    python scripts/profile_train.py --trace-dir /tmp/trace   # custom output dir
 """
 
 import argparse

@@ -4,9 +4,9 @@ Each configuration is tested independently to isolate the effect of single chang
 Reports step time, tokens/s, MFU, and peak memory.
 
 Usage:
-    python -m atlas_jax.benchmark                     # run all configs
-    python -m atlas_jax.benchmark --configs baseline   # run just baseline
-    python -m atlas_jax.benchmark --configs baseline batched_pe  # compare two
+    python scripts/benchmark.py                     # run all configs
+    python scripts/benchmark.py --configs baseline   # run just baseline
+    python scripts/benchmark.py --configs baseline batched_pe  # compare two
 """
 
 import argparse

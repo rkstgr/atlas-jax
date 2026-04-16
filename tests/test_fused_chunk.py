@@ -16,7 +16,7 @@ from atlas_jax.model import AtlasMemoryLayer, Block, Atlas
 
 # Skip all tests if fused chunk not available
 try:
-    from atlas_jax.fused_chunk import fused_chunk_scan, fused_chunk_available, _regular_fwd, _pe_coeffs_flat
+    from atlas_jax.kernels.fused_chunk import fused_chunk_scan, fused_chunk_available, _regular_fwd, _pe_coeffs_flat
     HAS_FUSED = fused_chunk_available()
 except ImportError:
     HAS_FUSED = False

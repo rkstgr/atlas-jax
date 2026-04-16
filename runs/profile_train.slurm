@@ -19,7 +19,7 @@ cd /p/project1/westai0047/atlas-jax && source .venv/bin/activate
 
 TRACE_DIR="/p/scratch/westai0047/nanochat/traces/atlas_paper_${SLURM_JOB_ID}"
 
-srun python -m atlas_jax.profile_train \
+srun python scripts/profile_train.py \
     --trace-dir="$TRACE_DIR" \
     --batch-size=4 --seq-len=1024 \
     --warmup-steps=3 --trace-steps=10 \

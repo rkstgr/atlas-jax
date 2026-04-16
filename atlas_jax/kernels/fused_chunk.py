@@ -26,15 +26,14 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 
-from atlas_jax.polar_express import polar_express_ste, polar_express, POLAR_EXPRESS_COEFFS
-from atlas_jax.state import DeepMemoryState
+from atlas_jax.memory_layer import polar_express_ste, polar_express, POLAR_EXPRESS_COEFFS, DeepMemoryState
 
 # Try to import Triton dependencies
 try:
     import triton
     import triton.language as tl
     import jax_triton as jt
-    from atlas_jax.triton_scan import triton_linear_scan
+    from atlas_jax.kernels.triton_scan import triton_linear_scan
     _HAS_TRITON = True
 except ImportError:
     _HAS_TRITON = False

@@ -8,11 +8,11 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from atlas_jax.pallas_fused import (
+from atlas_jax.kernels.pallas_fused import (
     _regular_fwd, _pallas_fused_fwd, fused_chunk_scan,
     pallas_available,
 )
-from atlas_jax.state import DeepMemoryState
+from atlas_jax.memory_layer import DeepMemoryState
 
 
 # Skip all tests if no GPU

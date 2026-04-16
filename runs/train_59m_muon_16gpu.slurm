@@ -32,7 +32,7 @@ srun --ntasks=1 nvidia-smi --query-gpu=name,memory.total --format=csv
 # Paper uses 0.5M tokens/batch. With 16 GPUs × 32/GPU × 1024 seq = 524,288 ≈ 0.5M
 # 500M tokens / 524,288 = 954 steps
 echo "==> Starting Atlas 59M Muon training (16×H100, 500M tokens)..."
-srun python -m atlas_jax.train_distributed \
+srun python scripts/train_distributed.py \
     --n-layer=8 --n-head=8 --n-embd=512 \
     --memory-expand=1 --deep-memory \
     --poly-degree=3 --omega-window=16 --chunk-size=64 \

@@ -15,7 +15,7 @@ For STE backward (identity), no backward through PE is needed.
 import jax
 import jax.numpy as jnp
 
-from atlas_jax.polar_express import POLAR_EXPRESS_COEFFS
+from atlas_jax.memory_layer import POLAR_EXPRESS_COEFFS
 
 
 # Pack coefficients as a JAX array for use inside fori_loop

@@ -3,9 +3,9 @@
 Measures step time, throughput, MFU for both code paths with various chunk sizes.
 
 Usage:
-    python -m atlas_jax.profile_fused                    # auto-detect GPU
-    python -m atlas_jax.profile_fused --preset h100      # H100 config
-    python -m atlas_jax.profile_fused --trace-dir /path  # save JAX traces
+    python scripts/profile_fused.py                    # auto-detect GPU
+    python scripts/profile_fused.py --preset h100      # H100 config
+    python scripts/profile_fused.py --trace-dir /path  # save JAX traces
 """
 
 import argparse

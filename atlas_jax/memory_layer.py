@@ -1,30 +1,304 @@
-"""Atlas memory layer: ShortConv + AtlasMemoryLayer.
+"""Atlas memory layer: everything related to the memory subsystem.
 
-Split out from model.py so the full-model file (MLP, Block, Atlas, init helpers)
-stays readable. See model.py for the module docstring describing the overall
-architecture.
+Consolidates polar_express, state, ops, kernel dispatch, fused_chunk,
+ShortConv, and AtlasMemoryLayer into a single module.
+
+Reference: arXiv 2505.23735 — Atlas: Learning to Optimally Memorize the
+Context at Test Time.
 """
+
+import math
+from functools import partial
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 import jax.lax as lax
 import equinox as eqx
 
-from atlas_jax import kernels
 from atlas_jax.config import AtlasConfig
-from atlas_jax.ops import (
-    rms_norm,
-    _gelu_derivative,
-    _omega_aggregate,
-    linear_scan,
-)
-from atlas_jax.polar_express import polar_express, polar_express_ste
-from atlas_jax.state import LinearMemoryState, DeepMemoryState
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Polar Express orthogonalization (Newton-Schulz iteration)
+# ============================================================================
+# Reference: arXiv 2505.16932 (Polar Express Sign Method)
+#
+# Per-step iteration (for square/wide matrices):
+#   A = X @ X^T
+#   B = b*A + c*(A @ A)
+#   X_{i+1} = a*X + B @ X
+#
+# Input is Frobenius-normalized before iteration.
+
+POLAR_EXPRESS_COEFFS = [
+    (8.156554524902461, -22.48329292557795, 15.878769915207462),
+    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
+    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
+    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
+    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
+]
+
+
+def polar_express(X, steps=5):
+    """Batched Polar Express orthogonalization.
+
+    Args:
+        X: (..., D1, D2) batch of matrices.
+        steps: number of Newton-Schulz iterations (1-5).
+
+    Returns:
+        Approximate orthogonal polar factor, same shape as X.
+    """
+    orig_dtype = X.dtype
+    X = X.astype(jnp.float32)
+    frob_norm = jnp.sqrt(jnp.sum(X * X, axis=(-2, -1), keepdims=True) + 1e-12)
+    X = X / (frob_norm * 1.01 + 1e-6)
+
+    d1, d2 = X.shape[-2], X.shape[-1]
+
+    if d1 > d2:
+        for a, b, c in POLAR_EXPRESS_COEFFS[:steps]:
+            A = jnp.einsum('...ji,...jk->...ik', X, X)
+            B = b * A + c * (A @ A)
+            X = a * X + X @ B
+    else:
+        for a, b, c in POLAR_EXPRESS_COEFFS[:steps]:
+            A = X @ jnp.swapaxes(X, -2, -1)
+            B = b * A + c * (A @ A)
+            X = a * X + B @ X
+
+    return X.astype(orig_dtype)
+
+
+def polar_express_ste(X, steps=5):
+    """Polar Express with straight-through estimator for backward pass."""
+    return X + jax.lax.stop_gradient(polar_express(X, steps) - X)
+
+
+def frobenius_clip(X, steps=None):
+    """Frobenius norm clipping: X / max(||X||_F, 1.0).
+
+    The `steps` argument is accepted but ignored (API compat with PE).
+    """
+    orig_dtype = X.dtype
+    X = X.astype(jnp.float32)
+    frob_norm = jnp.sqrt(jnp.sum(X * X, axis=(-2, -1), keepdims=True) + 1e-12)
+    X = X / jnp.maximum(frob_norm, 1.0)
+    return X.astype(orig_dtype)
+
+
+def frobenius_clip_ste(X, steps=None):
+    """Frobenius clipping with straight-through estimator."""
+    return X + jax.lax.stop_gradient(frobenius_clip(X) - X)
+
+
+# ============================================================================
+# Memory state containers
+# ============================================================================
+
+class LinearMemoryState(NamedTuple):
+    """State for linear (matrix-valued) memory per head."""
+    M: jax.Array    # (B, H, D, D) memory matrix
+    S: jax.Array    # (B, H, D, D) momentum matrix
+
+
+class DeepMemoryState(NamedTuple):
+    """State for deep MLP memory per head.
+
+    Memory is a 2-layer MLP: M(x) = x + W1 @ GELU(W2 @ x)
+    W2 is initialized to [I; 0] so GELU(W2 @ k) != 0 from step 1.
+    """
+    W1: jax.Array     # (B, H, D, E) first layer weights
+    W2: jax.Array     # (B, H, E, D) second layer weights
+    S_W1: jax.Array   # (B, H, D, E) momentum for W1
+    S_W2: jax.Array   # (B, H, E, D) momentum for W2
+
+
+def init_memory_state(config: AtlasConfig, batch_size: int, dtype=jnp.bfloat16):
+    """Create a fresh zero-initialized memory state for all heads.
+
+    Returns one state per layer (list of LinearMemoryState or DeepMemoryState).
+    """
+    H = config.n_head
+    D = config.n_embd // config.n_head
+    E = config.memory_expand * D if config.deep_memory else D
+    B = batch_size
+
+    states = []
+    for _ in range(config.n_layer):
+        if config.deep_memory:
+            W1 = jnp.zeros((B, H, D, E), dtype=dtype)
+            W2 = jnp.zeros((B, H, E, D), dtype=dtype)
+            eye = jnp.eye(min(E, D), dtype=dtype)
+            W2 = W2.at[:, :, :min(E, D), :min(E, D)].set(eye)
+            S_W1 = jnp.zeros((B, H, D, E), dtype=dtype)
+            S_W2 = jnp.zeros((B, H, E, D), dtype=dtype)
+            states.append(DeepMemoryState(W1=W1, W2=W2, S_W1=S_W1, S_W2=S_W2))
+        else:
+            M = jnp.zeros((B, H, D, D), dtype=dtype)
+            S = jnp.zeros((B, H, D, D), dtype=dtype)
+            states.append(LinearMemoryState(M=M, S=S))
+
+    return states
+
+
+# ============================================================================
+# Optional GPU kernel dispatch
+# ============================================================================
+# Centralizes try/except imports for Triton and Pallas kernel backends.
+# Consumers branch on HAS_* flags when a faster path is available.
+
+# --- FlashATLAS fused chunk scan (Triton preferred, Pallas fallback) ---
+fused_chunk_scan_kernel = None
+HAS_FUSED_CHUNK = False
+
+try:
+    from atlas_jax.kernels.fused_chunk import (
+        fused_chunk_scan as _fcs_triton,
+        fused_chunk_available as _fcs_triton_available,
+    )
+    if _fcs_triton_available():
+        fused_chunk_scan_kernel = _fcs_triton
+        HAS_FUSED_CHUNK = True
+except ImportError:
+    pass
+
+if not HAS_FUSED_CHUNK:
+    try:
+        from atlas_jax.kernels.pallas_fused import (
+            fused_chunk_scan as _fcs_pallas,
+            pallas_available as _pallas_available,
+        )
+        if _pallas_available():
+            fused_chunk_scan_kernel = _fcs_pallas
+            HAS_FUSED_CHUNK = True
+    except ImportError:
+        pass
+
+# --- Fused Triton Polar Express ---
+triton_polar_express = None
+triton_polar_express_ste = None
+HAS_TRITON_PE = False
+
+try:
+    from atlas_jax.kernels.triton_pe import (
+        triton_polar_express as _tpe,
+        triton_polar_express_ste as _tpe_ste,
+    )
+    triton_polar_express = _tpe
+    triton_polar_express_ste = _tpe_ste
+    HAS_TRITON_PE = True
+except ImportError:
+    pass
+
+# --- Fused Triton linear scan ---
+triton_linear_scan = None
+HAS_TRITON_SCAN = False
+
+try:
+    from atlas_jax.kernels.triton_scan import triton_linear_scan as _tls
+    triton_linear_scan = _tls
+    HAS_TRITON_SCAN = True
+except ImportError:
+    pass
+
+
+# ============================================================================
+# Stateless tensor ops
+# ============================================================================
+
+def rms_norm(x):
+    """RMS normalization over the last axis. Computed in f32 for bf16 stability."""
+    dtype = x.dtype
+    x = x.astype(jnp.float32)
+    ms = jnp.mean(x * x, axis=-1, keepdims=True)
+    return (x * jax.lax.rsqrt(ms + 1e-6)).astype(dtype)
+
+
+def _dropout(x, rate, key):
+    """Apply dropout with inverted scaling."""
+    keep = jax.random.bernoulli(key, 1.0 - rate, x.shape)
+    return jnp.where(keep, x / (1.0 - rate), 0.0)
+
+
+def _gelu_derivative(x):
+    """Exact derivative of GELU(x) = x * Phi(x). Computed in f32."""
+    x = x.astype(jnp.float32)
+    cdf = 0.5 * (1.0 + jax.lax.erf(x * 0.7071067811865476))
+    pdf = jnp.exp(-0.5 * x * x) * 0.3989422804014327
+    return cdf + x * pdf
+
+
+def _omega_aggregate(u, gamma, omega_window):
+    """Sliding window aggregation with per-position context gates.
+
+    For position t: sum_{i=max(0,t-w+1)}^{t} gamma_i * u_i
+    Uses cumsum for O(n) computation.
+
+    Args:
+        u: (B, cs, H, ...) per-position gradient values
+        gamma: (B, cs, H, 1, ...) per-position context gates, broadcastable to u
+        omega_window: sliding window size
+    """
+    cs = u.shape[1]
+    weighted = gamma * u
+    cum = jnp.cumsum(weighted, axis=1)
+    if omega_window >= cs:
+        return cum
+    shifted = jnp.concatenate([
+        jnp.zeros_like(cum[:, :omega_window]),
+        cum[:, :-omega_window]
+    ], axis=1)
+    return cum - shifted
+
+
+def linear_scan(h_init, gates, inputs):
+    """Linear recurrence: h_t = gate_t * h_{t-1} + input_t.
+
+    Uses fused Triton kernel when available (2-4x faster than associative scan),
+    falls back to jax.lax.associative_scan otherwise.
+
+    Args:
+        h_init: (B, H, ...) initial state
+        gates: (B, T, H) scalar gates per timestep
+        inputs: (B, T, H, ...) per-timestep inputs
+
+    Returns:
+        h_all: (B, T, H, ...) all intermediate states
+        h_final: (B, H, ...) final state
+    """
+    if HAS_TRITON_SCAN:
+        return triton_linear_scan(h_init, gates, inputs)
+
+    extra_dims = inputs.ndim - gates.ndim
+    gates_expanded = gates
+    for _ in range(extra_dims):
+        gates_expanded = gates_expanded[..., jnp.newaxis]
+
+    first_x = gates_expanded[:, 0:1] * h_init[:, jnp.newaxis] + inputs[:, 0:1]
+    modified_inputs = jnp.concatenate([first_x, inputs[:, 1:]], axis=1)
+    zeros = jnp.zeros_like(gates_expanded[:, 0:1])
+    modified_gates = jnp.concatenate([zeros, gates_expanded[:, 1:]], axis=1)
+
+    def associative_fn(a, b):
+        ga, xa = a
+        gb, xb = b
+        return (ga * gb, gb * xa + xb)
+
+    _, h_all = jax.lax.associative_scan(
+        associative_fn,
+        (modified_gates, modified_inputs),
+        axis=1,
+    )
+
+    h_final = h_all[:, -1]
+    return h_all, h_final
+
+
+# ============================================================================
 # ShortConv: causal depthwise 1D convolution
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 class ShortConv(eqx.Module):
     """Causal depthwise 1D convolution (per Titans / Based convention)."""
@@ -41,27 +315,23 @@ class ShortConv(eqx.Module):
     def __call__(self, x):
         """x: (B, T, D) -> (B, T, D), causal conv over time dim."""
         B, T, D = x.shape
-        # Transpose to (B, D, T) for conv
-        x = jnp.transpose(x, (0, 2, 1))  # (B, D, T)
-        # Causal left-padding
+        x = jnp.transpose(x, (0, 2, 1))
         x = jnp.pad(x, ((0, 0), (0, 0), (self.kernel_size - 1, 0)))
-        # Depthwise conv1d: each channel independently
-        # JAX conv_general_dilated with feature_group_count=D
         x = lax.conv_general_dilated(
-            x,                                          # (B, D, T+K-1)
-            self.weight.astype(x.dtype),                # (D, 1, K)
+            x,
+            self.weight.astype(x.dtype),
             window_strides=(1,),
             padding='VALID',
-            dimension_numbers=('NCW', 'OIW', 'NCW'),   # batch=N, channel=C, spatial=W
+            dimension_numbers=('NCW', 'OIW', 'NCW'),
             feature_group_count=D,
-        )  # (B, D, T)
+        )
         x = x + self.bias.astype(x.dtype)[:, jnp.newaxis]
-        return jnp.transpose(x, (0, 2, 1))  # (B, T, D)
+        return jnp.transpose(x, (0, 2, 1))
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # AtlasMemoryLayer
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 class AtlasMemoryLayer(eqx.Module):
     """Multi-head memory layer with Omega rule + Polar Express update.
@@ -124,7 +394,7 @@ class AtlasMemoryLayer(eqx.Module):
         H = config.n_head
         D = config.dim_head if config.dim_head is not None else config.n_embd // H
         E = config.memory_expand * D if config.deep_memory else D
-        dim_inner = H * D  # may differ from n_embd when dim_head is set
+        dim_inner = H * D
 
         self.n_head = H
         self.head_dim = D
@@ -140,8 +410,8 @@ class AtlasMemoryLayer(eqx.Module):
         self.stop_grad_chunks = config.stop_grad_chunks
         _d_is_pow2 = (D & (D - 1) == 0)
         _e_is_pow2 = (E & (E - 1) == 0)
-        self.fused_chunk = config.fused_chunk and kernels.HAS_FUSED_CHUNK and _d_is_pow2 and _e_is_pow2
-        if config.fused_chunk and kernels.HAS_FUSED_CHUNK and not (_d_is_pow2 and _e_is_pow2):
+        self.fused_chunk = config.fused_chunk and HAS_FUSED_CHUNK and _d_is_pow2 and _e_is_pow2
+        if config.fused_chunk and HAS_FUSED_CHUNK and not (_d_is_pow2 and _e_is_pow2):
             import warnings
             warnings.warn(
                 f"Fused chunk kernel disabled: D={D}, E={E} must both be powers of 2. "
@@ -149,11 +419,9 @@ class AtlasMemoryLayer(eqx.Module):
             )
 
         C = config.n_embd
-        # Q/K/V project from n_embd to dim_inner (= heads * dim_head)
         self.c_q = eqx.nn.Linear(C, dim_inner, use_bias=False, key=keys[0])
         self.c_k = eqx.nn.Linear(C, dim_inner, use_bias=False, key=keys[1])
         self.c_v = eqx.nn.Linear(C, dim_inner, use_bias=False, key=keys[2])
-        # Output projection: dim_inner back to n_embd
         self.c_proj = eqx.nn.Linear(dim_inner, C, use_bias=False, key=keys[3])
 
         self.conv_q = ShortConv(dim_inner, config.conv_kernel, key=keys[4])
@@ -170,28 +438,19 @@ class AtlasMemoryLayer(eqx.Module):
             self.gate_gamma = None
 
         if self.poly_degree > 0:
-            # All-ones coefficients: phi(x) = x + x^2 + ... + x^p
-            # Matches PyTorch elementwise mode (no 1/i! Taylor scaling)
             coeffs = jnp.ones(self.poly_degree)
             self.poly_coeffs = coeffs
         else:
             self.poly_coeffs = None
 
-        # ResidualNorm gamma (per head): LayerNorm(MLP(x)) * (gamma+1) + x
-        # Init=0 matches PyTorch (gamma starts at 0, so initially scale=1)
-        # But we also need the outer optimizer to learn gamma, so it stays as zeros
         self.ln_gamma = jnp.zeros((H, D))
 
-        # Learnable initial memory weights (Xavier uniform, matching PyTorch)
-        # PyTorch clones learned MLP params per batch*head at init. We store
-        # per-head initial weights that get broadcast to (B, H, D, E).
         k_w1, k_w2 = jax.random.split(keys[11])
         bound1 = (6.0 / (D + E)) ** 0.5
         bound2 = (6.0 / (E + D)) ** 0.5
         self.W1_init = jax.random.uniform(k_w1, (H, D, E), minval=-bound1, maxval=bound1)
         self.W2_init = jax.random.uniform(k_w2, (H, E, D), minval=-bound2, maxval=bound2)
 
-        # Retrieve gate: per-head sigmoid on memory output (PyTorch has this when heads > 1)
         if H > 1:
             self.retrieve_gate = eqx.nn.Linear(C, H, use_bias=False, key=keys[12])
         else:
@@ -207,14 +466,9 @@ class AtlasMemoryLayer(eqx.Module):
         return result
 
     def _process_chunk_linear(self, M, S, q_c, k_c, v_c, a_c, e_c, t_c, g_c):
-        """Process one chunk with linear memory.
-
-        Linear memory: M is a matrix, M(x) = M @ x (no residual/activation).
-        Gradient: u_t = 2 * (M @ k_t - v_t) outer k_t^T
-        """
+        """Process one chunk with linear memory."""
         _pe = polar_express_ste if self.pe_ste else polar_express
 
-        # Parallel: per-position gradients w.r.t. frozen M (f32 for bf16 stability)
         pred = jnp.einsum('bhvk,bchk->bchv', M, k_c)
         err = pred - v_c
         D = k_c.shape[-1]
@@ -223,53 +477,36 @@ class AtlasMemoryLayer(eqx.Module):
         k_f = k_c.astype(jnp.float32)
         u = ((2.0 / D) * jnp.einsum('bchv,bchk->bchvk', err_f, k_f)).astype(orig_dtype)
 
-        # Omega rule
         if self.omega_window > 1 and g_c is not None:
             u = _omega_aggregate(u, g_c[..., jnp.newaxis], self.omega_window)
 
-        # Momentum scan: S_t = theta_t * S_{t-1} - eta_t * u_t
-        theta = jnp.squeeze(t_c, axis=-1)         # (B, cs, H)
-        mom_input = -(e_c[..., jnp.newaxis] * u)  # (B, cs, H, D, D)
+        theta = jnp.squeeze(t_c, axis=-1)
+        mom_input = -(e_c[..., jnp.newaxis] * u)
         chunk_S, S = linear_scan(S, theta, mom_input)
 
-        # Polar Express orthogonalization
         chunk_S_orth = _pe(chunk_S, self.ns_steps)
 
-        # Memory scan: M_t = alpha_t * M_{t-1} + PE(S_t)
-        alpha = jnp.squeeze(a_c, axis=-1)          # (B, cs, H)
+        alpha = jnp.squeeze(a_c, axis=-1)
         M_all, M = linear_scan(M, alpha, chunk_S_orth)
 
-        # Output: y_t = M_t @ q_t
         y_c = jnp.einsum('bchvk,bchk->bchv', M_all, q_c)
 
         return y_c, LinearMemoryState(M=M, S=S)
 
     def _process_chunk_deep(self, state, q_c, k_c, v_c, a_c, e_c, t_c, g_c):
-        """Process one chunk with deep MLP memory.
-
-        Memory: M(x) = x + W1 @ GELU(W2 @ x) with residual connection.
-        Gradients computed analytically w.r.t. W1 and W2 with 1/D scaling
-        (matching PyTorch MSE mean(dim=-1)).
-
-        NOTE: PyTorch wraps memory in ResidualNorm(LayerNorm + gamma). Our analytical
-        approach uses plain residual. The ResidualNorm analytical gradients were
-        verified correct but produce worse training dynamics, likely due to
-        interaction with PE orthogonalization. Keeping plain residual for now.
-        """
+        """Process one chunk with deep MLP memory."""
         W1, W2, S_W1, S_W2 = state.W1, state.W2, state.S_W1, state.S_W2
-        if kernels.HAS_TRITON_PE:
-            _pe = kernels.triton_polar_express_ste if self.pe_ste else kernels.triton_polar_express
+        if HAS_TRITON_PE:
+            _pe = triton_polar_express_ste if self.pe_ste else triton_polar_express
         else:
             _pe = polar_express_ste if self.pe_ste else polar_express
 
-        # Forward through frozen MLP memory
         with jax.named_scope("mem_fwd"):
-            h = jnp.einsum('bhed,bchd->bche', W2, k_c)          # (B, cs, H, E)
-            act = jax.nn.gelu(h)                                   # (B, cs, H, E)
-            y_pred = k_c + jnp.einsum('bhde,bche->bchd', W1, act) # (B, cs, H, D)
-            err = y_pred - v_c                                      # (B, cs, H, D)
+            h = jnp.einsum('bhed,bchd->bche', W2, k_c)
+            act = jax.nn.gelu(h)
+            y_pred = k_c + jnp.einsum('bhde,bche->bchd', W1, act)
+            err = y_pred - v_c
 
-        # Gradient computation in f32 for bf16 numerical stability
         with jax.named_scope("mem_grad"):
             orig_dtype = err.dtype
             err_f = err.astype(jnp.float32)
@@ -277,43 +514,35 @@ class AtlasMemoryLayer(eqx.Module):
             D = k_c.shape[-1]
             scale = 2.0 / D
             u_W1 = (scale * jnp.einsum('bchd,bche->bchde', err_f, act_f)).astype(orig_dtype)
-            # Gradient w.r.t. W2: chain through GELU' and W1^T
-            gelu_prime = _gelu_derivative(h)                                     # f32 (always)
+            gelu_prime = _gelu_derivative(h)
             w1t_err = jnp.einsum('bhde,bchd->bche', W1.astype(jnp.float32), err_f)
             chain = w1t_err * gelu_prime
             u_W2 = (scale * jnp.einsum('bche,bchd->bched', chain, k_c.astype(jnp.float32))).astype(orig_dtype)
 
-        # Omega rule
         with jax.named_scope("omega"):
             if self.omega_window > 1 and g_c is not None:
-                g_w1 = g_c[..., jnp.newaxis]  # broadcast for (B, cs, H, D, E)
-                g_w2 = g_c[..., jnp.newaxis]  # broadcast for (B, cs, H, E, D)
+                g_w1 = g_c[..., jnp.newaxis]
+                g_w2 = g_c[..., jnp.newaxis]
                 u_W1 = _omega_aggregate(u_W1, g_w1, self.omega_window)
                 u_W2 = _omega_aggregate(u_W2, g_w2, self.omega_window)
 
-        theta = jnp.squeeze(t_c, axis=-1)  # (B, cs, H)
-        alpha = jnp.squeeze(a_c, axis=-1)  # (B, cs, H)
+        theta = jnp.squeeze(t_c, axis=-1)
+        alpha = jnp.squeeze(a_c, axis=-1)
 
-        # Fused momentum -> PE -> memory scan for both W1 and W2
-        # Process both weight matrices with shared gates
         mom_W1 = -(e_c[..., jnp.newaxis] * u_W1)
         mom_W2 = -(e_c[..., jnp.newaxis] * u_W2)
 
         if self.fused_chunk:
-            # FlashATLAS: single Triton kernel keeps carry in SRAM
             with jax.named_scope("flash_atlas"):
-                y_c, new_state = kernels.fused_chunk_scan(
+                y_c, new_state = fused_chunk_scan_kernel(
                     W1, W2, S_W1, S_W2,
                     mom_W1, mom_W2, theta, alpha, q_c,
                     self.ns_steps, self.pe_ste)
             return y_c, new_state
 
-        # Batched path: when D==E, stack W1/W2 to halve kernel launches
-        # (2 momentum scans -> 1, 2 PE calls -> 1, 2 memory scans -> 1)
         D, E = self.head_dim, self.expand_dim
         if D == E:
             with jax.named_scope("batched_momentum_scan"):
-                # Stack: (B, H, D, D) x2 -> (B, H, 2, D, D) -> flatten to (B, H, 2*D*D)
                 S_cat = jnp.concatenate(
                     [S_W1.reshape(*S_W1.shape[:2], -1),
                      S_W2.reshape(*S_W2.shape[:2], -1)], axis=-1)
@@ -328,8 +557,6 @@ class AtlasMemoryLayer(eqx.Module):
                 S_W2 = S_final_cat[..., DD:].reshape(*S_final_cat.shape[:2], E, D)
 
             with jax.named_scope("batched_polar_express"):
-                # Stack along dim 3: (B, cs, H, D, D) x2 -> (B, cs, H, 2, D, D)
-                # PE operates on last 2 dims, batch dims are transparent
                 stacked_S = jnp.stack([chunk_S_W1, chunk_S_W2], axis=3)
                 stacked_orth = _pe(stacked_S, self.ns_steps)
                 chunk_S_W1_orth = stacked_orth[:, :, :, 0]
@@ -348,7 +575,6 @@ class AtlasMemoryLayer(eqx.Module):
                 W1 = W_final_cat[..., :DD].reshape(*W_final_cat.shape[:2], D, E)
                 W2 = W_final_cat[..., DD:].reshape(*W_final_cat.shape[:2], E, D)
         else:
-            # Fallback: separate scan + PE + scan for each weight matrix
             def _fused_scan(S_init, W_init, theta, alpha, mom_input, name):
                 with jax.named_scope(f"{name}/momentum_scan"):
                     chunk_S, S_final = linear_scan(S_init, theta, mom_input)
@@ -363,7 +589,6 @@ class AtlasMemoryLayer(eqx.Module):
             with jax.named_scope("fused_W2"):
                 W2_all, W2, S_W2 = _fused_scan(S_W2, W2, theta, alpha, mom_W2, "W2")
 
-        # Output: y_t = q_t + W1_t @ GELU(W2_t @ q_t)
         with jax.named_scope("mem_output"):
             h_q = jnp.einsum('bched,bchd->bche', W2_all, q_c)
             g_q = jax.nn.gelu(h_q)
@@ -376,16 +601,13 @@ class AtlasMemoryLayer(eqx.Module):
         H, D = self.n_head, self.head_dim
         E = self.expand_dim
         cs = self.chunk_size
-        dim_inner = H * D  # may differ from C when dim_head is set
+        dim_inner = H * D
 
-        # Project (direct matmul, no vmap overhead) + short causal conv + multi-head reshape
         with jax.named_scope("qkv_proj"):
             q = self.conv_q((x @ self.c_q.weight.T).reshape(B, T, dim_inner)).reshape(B, T, H, D)
             k = self.conv_k((x @ self.c_k.weight.T).reshape(B, T, dim_inner)).reshape(B, T, H, D)
             v = self.conv_v((x @ self.c_v.weight.T).reshape(B, T, dim_inner)).reshape(B, T, H, D)
 
-        # Polynomial features + RMS norm
-        # PyTorch order: queries = norm(q) then poly(q), keys = poly(k) then norm(k)
         with jax.named_scope("qk_norm_poly"):
             if self.poly_degree > 0:
                 q = rms_norm(q)
@@ -395,28 +617,23 @@ class AtlasMemoryLayer(eqx.Module):
             else:
                 q, k = rms_norm(q), rms_norm(k)
 
-        # Input-dependent gates via sigmoid (direct matmul + bias)
-        # Paper: bias initialized at -2, so sigmoid(-2) ≈ 0.12 initially
         with jax.named_scope("gates"):
             def _gate(layer, x):
-                out = x @ layer.weight.T  # (B, T, H)
+                out = x @ layer.weight.T
                 if layer.bias is not None:
                     out = out + layer.bias
                 return jax.nn.sigmoid(out.reshape(B, T, H, 1))
 
             alpha = _gate(self.gate_alpha, x)
-            eta = _gate(self.gate_eta, x) * self.max_lr  # PyTorch: sigmoid * max_lr (default 0.1)
+            eta = _gate(self.gate_eta, x) * self.max_lr
             theta = _gate(self.gate_theta, x)
 
             gamma = None
             if self.omega_window > 1 and self.gate_gamma is not None:
                 gamma = _gate(self.gate_gamma, x)
 
-        # Initialize memory state if needed
         if memory_state is None:
             if self.deep_memory:
-                # Clone learned initial weights per batch (matching PyTorch's
-                # repeat of memory_model_parameter_dict per batch*head)
                 W1 = jnp.broadcast_to(
                     self.W1_init[jnp.newaxis].astype(x.dtype), (B, H, D, E))
                 W2 = jnp.broadcast_to(
@@ -429,14 +646,12 @@ class AtlasMemoryLayer(eqx.Module):
                 S = jnp.zeros((B, H, D, D), dtype=x.dtype)
                 memory_state = LinearMemoryState(M=M, S=S)
 
-        # Pad sequence to multiple of chunk_size
         T_orig = T
         if T % cs != 0:
             pad = cs - T % cs
             q = jnp.pad(q, ((0, 0), (0, pad), (0, 0), (0, 0)))
             k = jnp.pad(k, ((0, 0), (0, pad), (0, 0), (0, 0)))
             v = jnp.pad(v, ((0, 0), (0, pad), (0, 0), (0, 0)))
-            # alpha=1 carries memory unchanged, eta=0 no update, theta=0 kill momentum
             alpha = jnp.pad(alpha, ((0, 0), (0, pad), (0, 0), (0, 0)), constant_values=1.0)
             eta = jnp.pad(eta, ((0, 0), (0, pad), (0, 0), (0, 0)), constant_values=0.0)
             theta = jnp.pad(theta, ((0, 0), (0, pad), (0, 0), (0, 0)), constant_values=0.0)
@@ -447,9 +662,6 @@ class AtlasMemoryLayer(eqx.Module):
         n_chunks = T // cs
 
         def chunk_body(carry, chunk_data):
-            # NOTE: PyTorch uses full gradient flow across chunks via associative scan.
-            # Paper specifies stop_gradient (frozen boundary).
-            # stop_grad_chunks=True -> paper mode, False -> PyTorch mode.
             mem_state = jax.lax.stop_gradient(carry) if self.stop_grad_chunks else carry
             q_c, k_c, v_c, a_c, e_c, t_c, g_c = chunk_data
             if self.deep_memory:
@@ -463,9 +675,6 @@ class AtlasMemoryLayer(eqx.Module):
         process_fn = jax.checkpoint(chunk_body) if self.use_checkpoint else chunk_body
 
         if self.fused_chunk:
-            # Unrolled Python for-loop with transpose-free chunking.
-            # Keep (B, n_chunks, cs, ...) layout and index with [:, i] —
-            # avoids the (n_chunks, B, cs, ...) transpose that costs ~255ms.
             def _chunk_bt(x):
                 return x.reshape(B, n_chunks, cs, *x.shape[2:])
 
@@ -485,9 +694,8 @@ class AtlasMemoryLayer(eqx.Module):
                 state, y_c = process_fn(state, chunk_data)
                 ys.append(y_c)
             final_state = state
-            all_y = jnp.stack(ys, axis=1)  # (B, n_chunks, cs, H, D) — no transpose
+            all_y = jnp.stack(ys, axis=1)
         else:
-            # lax.scan path: needs (n_chunks, B, cs, ...) for the scan axis
             def _chunk(x):
                 return x.reshape(B, n_chunks, cs, *x.shape[2:]).transpose(1, 0, 2, *range(3, x.ndim + 1))
 
@@ -502,23 +710,17 @@ class AtlasMemoryLayer(eqx.Module):
             xs = (q_chunks, k_chunks, v_chunks, a_chunks, e_chunks, t_chunks, g_chunks)
             final_state, all_y = lax.scan(process_fn, memory_state, xs)
 
-        # all_y -> (B, T, H, D)
         if self.fused_chunk:
-            # (B, n_chunks, cs, H, D) — already B-first, just reshape
             y = all_y.reshape(B, T, H, D)
         else:
-            # (n_chunks, B, cs, H, D) — needs transpose
             y = jnp.transpose(all_y, (1, 0, 2, 3, 4)).reshape(B, T, H, D)
 
-        # Trim padding
-        y = y[:, :T_orig]  # (B, T_orig, H, D)
+        y = y[:, :T_orig]
 
-        # Retrieve gate: per-head sigmoid gating (PyTorch: when heads > 1)
         if self.retrieve_gate is not None:
-            gate = jax.nn.sigmoid(x @ self.retrieve_gate.weight.T)  # (B, T_orig, H)
-            y = y * gate[..., jnp.newaxis]  # (B, T_orig, H, D) * (B, T_orig, H, 1)
+            gate = jax.nn.sigmoid(x @ self.retrieve_gate.weight.T)
+            y = y * gate[..., jnp.newaxis]
 
-        # Project back to residual stream
         y = y.reshape(B, T_orig, -1)
         y = (y @ self.c_proj.weight.T).reshape(B, T_orig, C)
 

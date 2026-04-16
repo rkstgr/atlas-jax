@@ -122,7 +122,7 @@ def main():
     jax.config.update("jax_default_matmul_precision", "high")
 
     from atlas_jax.model import AtlasMemoryLayer, MLP, linear_scan, rms_norm
-    from atlas_jax.polar_express import polar_express_ste
+    from atlas_jax.memory_layer import polar_express_ste
 
     B, T = 32, 2048
     cfg = AtlasConfig(

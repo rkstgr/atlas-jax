@@ -1,0 +1,58 @@
+\section{Additional Related Work}\label{app:rw}
+
+
+
+
+\head{Modern Linear Recurrent Neural Networks\footnote{Note that here the term ``linear'' refers to their fast training and inference procedures. This does not refer to their recurrence formula as some models like Titans~\citep{behrouz2024titans}, \textsc{Yaad, Moneta, Memora}~\citep{behrouz2025Miras}, and TTT~\citep{sun2024learning} are based on \emph{non-linear} recurrence but fast at training and inference.}}
+Recent research endeavors have concentrated on mitigating the quadratic computational complexity and inherent limitations of Transformer models in processing long-context sequences. This has led to the development of efficient recurrent alternatives, primarily motivated by their rapid inference and training capabilities~\citep{tiezzi2024resurgence}. Initial advancements in this domain, exemplified by models such as RetNet~\citep{sun2023retentive}, RWKV~\citep{peng2023rwkv}, and S5~\citep{smith2023simplified}, employed data-independent transition matrices coupled with Hebbian-like update mechanisms. Subsequently, a second generation of models emerged, incorporating input-dependent parameters within these linear architectures (e.g., linear RNNs~\citep{hasani2023liquid, smith2023simplified}, RWKV6~\citep{peng2024eagle}). These models also explored more expressive memory updating rules, notably those based on the delta rule~\citep{peng2025rwkv7, schlag2021linear, yang2024parallelizing, yang2024gated, liu2024longhorn}. Further evolution in this line of research has extended these memory architectures to deeper models, while concurrently utilizing delta-rule-like update mechanisms~\citep{sun2024learning} or data-dependent momentum-based update rules with forget gating~\citep{behrouz2024titans}. More recently, to augment the performance of delta-rule-based sequential models, \citet{siems2025deltaproduct} have proposed the application of multiple gradient descent updates per token, thereby yielding more expressive sequence models, particularly in state tracking tasks. In addition to the above fast linear recurrent sequence models, several studies have focused on RNNs with non-linear recurrence~\citep{behrouz2025Miras, csordas2024recurrent, merrill2024the, lim2024parallelizing,  schone2025implicit, karami2025lattice, von2023uncovering, gonzalez2024towards}, and how their training can be faster~\citep{gonzalez2024towards, lim2024parallelizing, schone2025implicit}. 
+
+
+
+
+
+
+
+\head{Fast Weight Programs}
+The conceptualization of linear layers as key-value associative memory systems can be traced back to Hopfield networks~\citep{hopfield1982neural}. This concept was subsequently developed in the context of fast weight programmers, wherein dynamic fast programs are integrated into recurrent neural networks to serve as writable memory stores~\citep{schlag2021linear, schmidhuber1992learning, schmidhuber1993reducing}. Among the learning paradigms for such systems, Hebbian learning~\citep{hebb2005organization} and the delta rule~\citep{prados1989neural} have emerged as the most prominent. Both learning rules have been the subject of extensive investigation within the existing literature~\citep{munkhdalai2017neural, schmidhuber1992learning, munkhdalai2019metalearned, schlag2021linear, irie2021going, yang2024parallelizing, yang2024gated}.
+
+
+
+
+
+\head{Hopfield Networks} 
+Our formulation is architecturally founded upon the broad concept of associative memory, wherein the primary objective is to learn an underlying mapping between keys and values. Seminal work by \citet{hopfield1982neural} on Hopfield Networks introduced one of the earliest neural architectures explicitly based on associative memory, defining it through the minimization of an energy function for storing key-value pairs. Although traditional Hopfield networks have seen diminished applicability in recent years, primarily due to constraints in vector-valued memory capacity and the nature of their energy function, several contemporary studies have focused on enhancing their capacity through various methodologies. These include efforts by \citet{krotov2021hierarchical}, \citet{li2024expressive}, and \citet{krotov2016dense}. Notably, extensions to the energy function of these models, often incorporating exponential kernels, have been explored~\citep{krotov2016dense, lucibello2024exponential}. Furthermore, the relationship between these modernized Hopfield networks and Transformer architectures has been a subject of recent investigation~\citep{ramsauer2021hopfield, hu2024provably}.
+
+
+
+
+
+
+
+
+
+
+\section{\textsc{Miras} Framework}\label{app:miras}
+As discussed earlier, \citet{behrouz2025Miras} formalized the concept of associative memory as:
+\begin{dfn}[\citet{behrouz2025Miras}] \label{dfn:associative-memory2}
+Given a set of keys $\mathcal{K} \subseteq \mathbb{R}^{d_k}$ and values $\mathcal{V} \subseteq \mathbb{R}^{d_v}$, associative memory is an mapping $\M: \mathcal{K} \rightarrow \mathcal{V}$. Learning the associative memory is based on an objective $\mathcal{L}$, called \emph{Attentional Bias}, that determines the type of memory and its priorities:
+\begin{align}\label{eq:attentional-bias-loss2}
+    \M^* = \arg\min_{\M}\quad \mathcal{L}(\M(\mathcal{K}); \mathcal{V}).
+\end{align}
+\end{dfn}
+Optimizing this objective using an iterative algorithm (e.g., gradient descent) results in the memory update rule. Thus, the sequence model is a meta in-context learner with two  optimization levels:
+\begin{enumerate}
+    \item \textcolor{c3}{Inner Loop}: Where parameters of the memory module are optimized (i.e., $\boldsymbol{\theta}_{\M} = \{W_1, W_2, \dots, W_{\mathcal{L}_{\M}, \dots}\}$). In the inner optimization loop, all other parameters from the model are considered hyperparameters and are fixed and \emph{not} optimized.   
+    \item \textcolor{c3}{Outer Loop}: Where all other parameters of the model are optimized, such as linear projections, MLP layers, convolutions, etc. 
+\end{enumerate}
+
+
+\subsection{Examples}
+As an example, one can define the linear attention as the optimization of dot-product similarity with gradient descent: i.e., $\tilde{\ell}_t := \inner{\M_{t-1} \vk_t}{\vv_t}$. That is,
+\begin{align}
+    \M_t &= \M_{t-1} - \eta_t \nabla  \tilde{\ell}_t(\M_{t-1}; \vk_t, \vv_t) = \M_{t-1} - \eta_t \nabla  \inner{\M_{t-1} \vk_t}{\vv_t} \\
+    &= \M_{t-1} + \eta_t \vv_t \vk_t^{\top}.
+\end{align}
+As an another example, if we use regression loss, instead of the dot-product similarity, we can obtain the DeltaNet~\citep{schlag2021linear}:
+\begin{align}
+    \M_t &= \M_{t-1}  - \eta_t \nabla \| \M_t \vk_t - \vv_t \|^{2}_2 = \mathbf{I} - \eta_t \vk_t \vk_t^{\top} \M_{t-1} + \vv_t \vk_t^{\top}.
+\end{align}

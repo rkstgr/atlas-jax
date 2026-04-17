@@ -1,0 +1,301 @@
+
+
+
+\section{Supporting Proofs}
+\Capacity*
+\begin{proof}
+Let $K = [\vk_1 \cdots \vk_m] \in \mathbb{R}^{d_k \times m}$ and $V = [\vv_1 \cdots \vv_m] \in \mathbb{R}^{d_v \times m}$. The optimization problem becomes minimizing the Frobenius norm $\|\M K - V\|_2^2$. Exact memorization requires solving the linear system $\M K = V$.
+
+Vectorizing the expression yields the system $(K^\top \otimes I_{d_v}) \mathrm{vec}(\M) = \mathrm{vec}(V)$, which has $m d_v$ scalar equations in $d_k d_v$ unknowns. When the keys are linearly independent, $\operatorname{rank}(K) = m$, and hence the system matrix has full row rank $m d_v$. Solvability thus requires $m d_v \le d_k d_v$, or equivalently $m \le d_k$. This matches classic results on the storage capacity of linear associative memories such as the Willshaw model and Hopfield networks, where capacity is tied to the rank of the input embedding \citep{willshaw1969non, hopfield1982neural}.
+
+When $m \le d_k$ and $K$ has full column rank, one can construct an exact interpolating solution via the Moore–Penrose pseudoinverse: $\M^* = V K^\top$. Then $\M^* K = V K^{\top} K = V$, achieving zero training error. Thus the upper bound is tight.
+
+Moreover, full-batch gradient descent on this objective with step size $0 < \eta < 2 / \lambda_{\max}(K K^\top)$ yields iterates $\M_{t+1} = \M_t - \eta (\M_t K - V) K^\top$, which converge to the minimum-norm interpolating solution $\M^\dagger = V K^\top$ when $m \le d_k$. This is a well-known implicit bias of gradient descent in overparameterized linear models \citep{satpathi2021dynamics}.
+
+Finally, the same rank-based constraint governs the capacity of linear or multi-head attention modules. In such architectures, the output context matrix has rank at most $\operatorname{rank}(K) \le d_k$, which directly limits their expressivity. Recent analyses identify this “low-rank bottleneck” as a capacity-limiting effect in Transformers \citep{bhojanapalli2020low}.
+\end{proof}
+
+\DeepMemory*
+Early theoretical works established that even simple network architectures can memorize a significant number of input-output mappings, with capacity often related to the number of network parameters (e.g., weights and biases) and the input dimensionality \citet{cover1965geometricalproperties, baum1988capabilitiesmultilayer,  huang2003learningcapability}. For instance, ~\citet{baum1988capabilitiesmultilayer} demonstrated that $\left\lceil \frac{N}{d} \right\rceil$ neurons are sufficient for a single-hidden-layer network with threshold units to memorize $N$ input-label pairs from $\mathbb{R}^d$.
+
+Networks employing Rectified Linear Units (ReLUs), exhibit a piecewise affine behavior. The input space is partitioned into numerous linear regions, and within each region, the network computes a distinct affine transformation~\citet{montufar2014numberlinearregions, pascanu2014numberresponseregionsdeep}. This structure is pivotal for analyzing their expressive power and storage capacity. The precise relationship between depth, width, the number of linear regions, and the ultimate capacity to store specific key-value associations, especially with constraints like linearly independent keys, remains an active area of research.
+
+\begin{proof}
+% We establish the stated \emph{upper} and \emph{lower} bounds separately.
+
+Let $m$ denote the number of $(\vk_i, \vv_i)$ pairs memorized exactly by $\M$, and assume the keys $\{\vk_i\}_{i=1}^m \subset \R^{d_k}$ are linearly independent. Let $d_h^{(0)} := d_k$, $d_h^{(\cL_\M)} := d_v$, and for each layer $1 \le \ell \le \cL_\M$, define $W^{(\ell)} \in \R^{d_h^{(\ell)} \times d_h^{(\ell-1)}}$. Biases are omitted for simplicity.
+
+Since $\sigma(x) = \max(0,x)$ is piecewise linear, the composition of linear maps and ReLU activations yields a piecewise affine function. For any fixed activation pattern (i.e., fixed sign of pre-activations), the MLP acts as:
+
+\begin{align*}
+\M(\cdot) = A \cdot + B, \quad \text{where } A = W^{(\cL_\M)} D^{(\cL_\M - 1)} W^{(\cL_\M - 1)} \cdots D^{(1)} W^{(1)},
+\end{align*}
+
+and each $D^{(\ell)}$ is a diagonal $\{0,1\}$ matrix selecting the active units. Therefore, when all keys fall into the same linear region (which occurs generically after a small perturbation), $\M$ is a single affine transformation.
+
+Let $\mathbf{K} := [\vk_1\; \cdots\; \vk_m] \in \R^{d_k \times m}$ and $\mathbf{V} := [\vv_1\; \cdots\; \vv_m] \in \R^{d_v \times m}$. Exact memorization implies $A \mathbf{K} = \mathbf{V}$, so:
+
+\begin{align*}
+\rank(\mathbf{V}) \le \rank(A), \quad m = \rank(\mathbf{K}) \le \min\{\rank(A), d_k\}.
+\end{align*}
+
+Now observe:
+\begin{align*}
+A = W^{(\cL_\M)} \underbrace{D^{(\cL_\M-1)} W^{(\cL_\M -1)}}_{R_{\cL_\M -1}} \cdots \underbrace{D^{(1)} W^{(1)}}_{R_1},
+\end{align*}
+and thus the rank of $A$ is bounded by the minimal width encountered along each path times the immediate input dimension:
+\begin{align*}
+\rank(A) \le \sum_{i=1}^{\cL_\M} \left( \min_{j \ge i} d_h^{(j)} \right) d_h^{(i)} 
+= \mathcal{O}\left( d_k d_v \sum_{i=1}^{\cL_\M} \min_{j \ge i} d_h^{(j)} d_h^{(i+1)} \right).
+\end{align*}
+
+Hence,
+\begin{align*}
+m \le \mathcal{O}\left( d_k d_v \sum_{i=1}^{\cL_\M} \min_{j \ge i} d_h^{(j)} d_h^{(i+1)} \right)
+\end{align*}
+\end{proof}
+\PolyCapacity*
+\begin{proof}
+Let us begin by analyzing the dimension of the lifted feature space induced by $\phi_p$. A monomial in $d_k$ variables of total degree exactly $\ell$ has the form $\vk^\alpha = \prod_{j=1}^{d_k} k_j^{\alpha_j}$, where $\alpha \in \mathbb{N}^{d_k}$ and $|\alpha| := \sum_{j=1}^{d_k} \alpha_j = \ell$. The number of such monomials is given by the classical stars-and-bars formula, which counts the number of integer solutions to $\alpha_1 + \cdots + \alpha_{d_k} = \ell$, yielding
+\begin{align*}
+  \binom{d_k + \ell - 1}{\ell}.
+\end{align*}
+Summing over all degrees $\ell = 0$ to $p$ gives the total number of monomials (i.e., the output dimension of $\phi_p$),
+\begin{align*}
+  D = \sum_{\ell=0}^p \binom{d_k + \ell - 1}{\ell} = \binom{d_k + p}{p},
+\end{align*}
+where the final identity follows from the hockey-stick identity in combinatorics.
+
+To characterize the memorization capacity, we reformulate the loss in matrix notation. Let $\Phi := [\phi_p(\vk_1)\;\cdots\;\phi_p(\vk_m)] \in \mathbb{R}^{D \times m}$ and $V := [\vv_1\;\cdots\;\vv_m] \in \mathbb{R}^{d_v \times m}$. Then the objective becomes
+\begin{align*}
+  L(\M) = \tfrac{1}{2} \|\M \Phi - V\|_2^2.
+\end{align*}
+Exact memorization corresponds to the existence of a matrix $\M$ such that $\M \Phi = V$. This is a linear system in which $\M$ acts on the columns of $\Phi$, so the rank of $\Phi$ necessarily limits the number of independent targets $\vv_i$ that can be fitted exactly.
+
+By the sub-multiplicativity of rank, for any matrices $A$ and $B$, we have
+\begin{align*}
+  \operatorname{rank}(AB) \le \min\{\operatorname{rank}(A), \operatorname{rank}(B)\}.
+\end{align*}
+Applying this to $\M \Phi$ yields
+\begin{align*}
+  \operatorname{rank}(\M \Phi) \le \operatorname{rank}(\Phi) \le D.
+\end{align*}
+Now consider a case where the targets $\vv_1, \dots, \vv_m$ are linearly independent; for instance, take $V = [e_1, \dots, e_m]$, the first $m$ standard basis vectors. Then $\operatorname{rank}(V) = m$. If $m > D$, we necessarily have $\operatorname{rank}(\M \Phi) < \operatorname{rank}(V)$ for every choice of $\M$, implying that the system $\M \Phi = V$ is unsolvable. Hence, the loss remains strictly positive, and exact memorization is impossible.
+
+This establishes that no method, regardless of optimization procedure, can memorize more than $D = \binom{d_k + p}{p}$ independent input-output pairs under a degree-$\le p$ polynomial lifting. Since $\binom{d_k + p}{p} = \Theta(d_k^p)$ for fixed $p$, the result follows: the memorization capacity is bounded above by $\mathcal{O}(d_k^p)$.
+\end{proof}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\section{Detailed Formulations of All Architectures}\label{app:all-arch}
+In this section, for the sake of clarity, we discuss the details of all architectures that we discuss through the paper:
+
+\subsection{Deep Linear Attention (DLA)}
+We design Deep Linear Attention (DLA)—linear attention module that uses a deep MLP as the memory (KV cache)—as one of the baselines of this study. Given input $\vx \in \R^{N \times  d_{\text{in}}}$, we project the input into matrices of keys, values and queries:
+\begin{align}
+    \mb{Q} = \begin{pmatrix} \vq_1 \\ \vdots \\ \vq_N
+    \end{pmatrix}= \vx \mb{W}_{Q}, \qquad \quad \mb{K} = \begin{pmatrix} \vk_1 \\ \vdots \\ \vk_N
+    \end{pmatrix} = \vx \mb{W}_{K}, \qquad \quad  \mb{V} = \begin{pmatrix} \vv_1 \\ \vdots \\ \vv_N
+    \end{pmatrix} = \vx \mb{W}_{V},
+\end{align}
+where $\mb{W}_{Q}, \mb{W}_{K},$ and $\mb{W}_{V}$ are learnable linear layers. We then define memory as  a learning module that optimizes the inner-dot product similarity using gradient descent: i.e., 
+\begin{align}
+    \min_{\M} \undermath{\ell(\M_{t-1}; \vk_t, \vv_t)}{\inner{\M(\vk_t)}{\vv_t}}.
+\end{align}
+The above optimization using gradient descent results in the following recurrence (we also add weight decay with input-dependent parameter $\alpha_t$):
+\begin{align}
+    \M_{t} = \alpha_t \M_{t-1}  - \eta_t \nabla \ell(\M_{t-1}; \vk_t, \vv_t)
+\end{align}
+which in the case of linear memory (i.e., $\M_t = W_t \in \R^{d \times d}$) it becomes:
+\begin{align}
+    W_{t} = \alpha_t W_{t-1} + \vv_t \vk_t^{\top},
+\end{align}
+which is the formulation of gated linear attention. We use the same training process as other models (see \autoref{sec:parallelization}).
+
+\subsection{Sliding Window Linear Attention (SWLA)}
+The design of SWLA is the same as the design of DLA, but with the use of sliding window objective. That is, given keys, values, and queries:
+\begin{align}
+    \mb{Q} = \begin{pmatrix} \vq_1 \\ \vdots \\ \vq_N
+    \end{pmatrix}= \vx \mb{W}_{Q}, \qquad \quad \mb{K} = \begin{pmatrix} \vk_1 \\ \vdots \\ \vk_N
+    \end{pmatrix} = \vx \mb{W}_{K}, \qquad \quad  \mb{V} = \begin{pmatrix} \vv_1 \\ \vdots \\ \vv_N
+    \end{pmatrix} = \vx \mb{W}_{V},
+\end{align}
+we optimize the internal objective of:
+\begin{align}
+    \min_{\M} \undermath{\ell(\M_{t-1}; \vk_t, \vv_t)}{\sum_{i = t - c + 1}^{t}\inner{\M_{t-1}(\vk_i)}{\vv_i}}.
+\end{align}
+The above formulation, results in:
+\begin{align}
+     \M_{t} = \alpha_t \M_{t-1}  - \nabla \ell(\M_{t-1}; \vk_t, \vv_t) = \alpha_t \M_{t-1}  - \sum_{i = t - c + 1}^{t}  \eta^{(t)}_i \nabla \inner{\M_{t-1}(\vk_i)}{\vv_i},
+\end{align}
+which in the case of linear memory (i.e., $\M_t = W_t \in \R^{d \times d}$) it becomes:
+\begin{align}
+    \M_{t} = \alpha_t \M_{t-1}  - \sum_{i = t - c + 1}^{t} \eta^{(t)}_i  \vv_i \vk_i^{\top}.
+\end{align}
+
+\subsection{\omodel}
+In the design of \omodel, we use replace the dot-prodcut similarity objective with $\ell(\M_{t-1}; \vk_t, \vv_t) = \sum_{i = t - c + 1}^{t} \| \M_{t-1}(\phi(\vk_i)) - \vv_i \|^{2}_2$ ,which results in the recurrence of:
+\begin{align}
+     \M_{t} = \alpha_t \M_{t-1}  - \nabla \ell(\M_{t-1}; \vk_t, \vv_t) = \alpha_t \M_{t-1}  - \sum_{i = t - c + 1}^{t}  \eta^{(t)}_i \nabla \| \M_{t-1}(\phi(\vk_i)) - \vv_i \|^{2}_2.
+\end{align}
+In the above formulation, $\phi(.)$ is the polynomial feature mapping function.
+
+
+\subsection{\model}
+In the \model, we use the same internal objective as \omodel{} but we optimize it using Muon optimizer~\citep{jordan2024muon} with weight decay. That is, 
+\begin{align}
+    \M_{t} &= \alpha_t\M_{t-1} + \texttt{Newton-schulz5}(\SSS_t)\\
+    \SSS_t &= \theta_t \SSS_{t-1} - \sum_{i = t - c + 1}^{t}  \eta^{(t)}_i \nabla \| \M_{t-1}(\phi(\vk_i)) - \vv_i \|^{2}_2.
+\end{align}
+
+
+
+
+
+\section{Experimental Details} \label{app:exp-details}
+In our experimental setup we follow recent studies on linear recurrent models~\citep{yang2024gated, behrouz2024titans, behrouz2025Miras}, we use Wikitext~\citep{merity2017pointer}, LMB~\citep{paperno-etal-2016-lambada}, PIQA~\citep{bisk2020piqa}, HellaSwag~\citep{zellers-etal-2019-hellaswag}, WinoGrande~\citep{sakaguchi2021winogrande},  ARC-easy (ARC-e) and ARC-challenge (ARC-c)~\citep{clark2018think}, SIQA~\citep{sap-etal-2019-social}, and BoolQ~\citep{clark-etal-2019-boolq}. Also, the baselines results are from \citet{behrouz2025Miras, behrouz2024titans}. In the training, we use T5 tokenizer with a vocabulary size of 32K and use training length of 4K tokens (2K for SWA). We employ AdamW optimizer with learning rate of $4e$-$4$ with cosine annealing schedule with batch size of 0.5M tokens, and weight decay of $0.1$. The architectural details are also reported in \autoref{tab:exp-details}. The baseline results for 1.3B are from \citet{yang2024gated} and for 760M are from
+\citet{behrouz2024titans, behrouz2025Miras}.
+
+For the memory architecture, unless state otherwise, we use an MLP with $2$ layers with expansion factor of 4 and GELU activation function~\citep{hendrycks2016gaussian}. We also use residual connections and layer norm at the end of each chunk: $\M(x) = x + W_1 \sigma(W_2 x)$. 
+
+
+\begin{table*}
+    \centering
+    \caption{Architectural Details.}
+    \label{tab:exp-details}
+    \resizebox{0.5\linewidth}{!}{
+    \begin{tabular}{c c c c c c}
+    \toprule
+         Model    & Block & Dim & Head & Peak LR & Token\\
+         \midrule
+         \midrule
+        170M & 12 & 768 & 16 & 3e-3 & 15B\\
+        340M & 24 & 1024 & 16 & 1.5e-3 & 15B\\
+        760M & 24 & 1536 & 16 & 1.25e-3 & 30B\\
+        1.3B & 18 & 2048 & 8 & 7e-4 & 100B \\
+    \toprule
+    \end{tabular}
+    }
+\end{table*}
+
+
+
+
+
+
+
+\section{Additional Experimental Results} \label{app:exp}
+In this section,  we provide additional experimental results to support the design of our models, understand the effect of different components and also evaluate their performance in long context, in-context recall and MAD tasks. 
+
+
+
+
+
+
+
+\subsection{Language Modeling and Common-sense Reasoning (Small Scale)}
+In \autoref{sec:experiments} we presented a subset of results on language modeling and common-sense reasoning tasks. In this section, we further report the results for all scales of models. The results are in \autoref{tab:lm_results_full}. 
+
+\head{State-of-the-art Results} 
+Looking at the performance of \model{} and \omodel, both architectures perform favorably compared to modern linear recurrent models and Transformers, achieving lower perplexity and better accuracy in downstream tasks. Even the fully recurrent version of these models outperform hybrid models such as Samba~\citep{ren2024samba} and Gated DeltaNet-H2~\citep{yang2024gated}. Using the hybrid variants of MAG and MAL further improve the performance of \model, which shows the complementary role of recurrent long-term memory and attention.  
+
+
+\head{The Effect of Design}
+Comparing the performance of \model, \omodel, and baselines SWLA and DLA, we can see the role of $\ell_2$ regression loss as the attentional bias. Also, the better performance of SWLA compared to GLA and RetNet indicates the importance of memorizing the context, instead of memorizing individual tokens. 
+
+
+
+
+
+
+
+
+
+\begin{table*}[t!]
+\centering
+\caption{
+Performance of \model{} and baselines on language modeling and common-sense reasoning tasks. The best results are highlighted \colorbox{myblue}{highlighted}. 
+}\label{tab:lm_results_full}
+\centering
+\resizebox{0.9\linewidth}{!}{
+\centering
+\begin{tabular}{l|c c|c c c c c c c c c}
+\toprule
+\textbf{Model}  & \textbf{Wiki.}  &  \textbf{LMB.} &  \textbf{LMB.} & \textbf{PIQA} &    \textbf{Hella.} & \textbf{Wino.} & \textbf{ARC-e} &  \textbf{ARC-c} &  \textbf{SIQA}  & \textbf{BoolQ} &  \textbf{Avg.} \\
+ & ppl $\downarrow$  &  ppl $\downarrow$  &  acc $\uparrow$  & acc $\uparrow$ &   acc\_n $\uparrow$  & acc $\uparrow$  & acc $\uparrow$ & acc\_n $\uparrow$ &  acc $\uparrow$  & acc $\uparrow$ &   $\uparrow$  \\
+\midrule
+\midrule
+\multicolumn{12}{c}{340M params / 15B tokens} \\
+\midrule
+ Transformer++ & 31.52 & 41.08 &  30.76 & 62.98  &  34.76 & 50.53  & 45.21  & 24.05 & 36.81 & 58.24 & 42.92\\
+ RetNet & 32.50 & 49.73 & 28.24 & 62.61 & 34.15 &  50.91 & 44.27 & 23.62 & 36.79 & 59.72 & 42.54\\
+ GLA & 28.51 & 43.02 & 28.73 & 64.05 & 35.96 & 50.00 & 54.19 & 24.29 & 37.13 & 58.39 & 44.09\\
+ Mamba & 30.83 & 40.21 & 29.94 & 63.79 & 35.88 & 49.82 & 49.24 & 24.56 &  35.41  & 60.07 & 43.59\\
+ DeltaNet & 28.65 & 47.30 & 28.43 & 63.52 & 35.95 & 49.63 & 52.68 & 25.37 &   {37.96}  &  58.79  & 44.04 \\
+ TTT & 27.44 & 34.19 & 30.06 & 63.97  & 35.71 & 50.08 & 53.01 & 26.11 & 37.32 & 59.83 & 44.51\\
+ Gated DeltaNet & 27.01 & 30.94 &  34.11 & 63.08 & 38.12  &   51.60  &  55.28  &  26.77  & 34.89 & 59.54  & 45.42\\
+\textsc{Moneta} & 26.19 &  29.31 &   35.70  & 63.99  & 39.23  & 52.04  &  55.96  &  27.15 & 37.29 &   60.22 &   46.44 \\
+\textsc{Yaad} & 26.61 &   29.11 &  34.09  & 64.93  &  39.86  & 51.12  & 54.75  &  28.64 & 33.82 & 60.29 & 45.93 \\
+\textsc{Memora} & 27.16 &  30.44 &  33.68  &  65.21  & 39.17  & 51.23  & 53.40  & 27.99 & 34.1& 59.29 & 45.51 \\
+\midrule
+DLA (ours) & 27.93 & 35.09 & 30.8 & 62.9 & 36.2  & 50.4 & 53.5 & 26.7 & 37.1 & 59.7 & 44.76 \\
+SWDT (ours) & 26.98 & 33.95 & 32.4 & 63.1 & 38.2 & 50.9 & 54.9 & 25.9 & 37.5 & 59.6 & 45.31\\
+\midrule
+\omodel{} (ours) & 26.03 & 28.76  & 35.6 & 65.3 & 39.7 & 52.0 & 56.1 & 28.6 & 37.7 & 60.4 & 46.93\\
+\model{} (ours) & 25.88  & 28.54  & 36.1 & 64.9 & 40.1 & 52.7 & 56.4 & 28.8 & 38.1 & 61.2 & 47.28\\
+\bottomrule
+\end{tabular}
+}
+\end{table*}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

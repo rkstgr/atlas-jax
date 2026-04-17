@@ -1,0 +1,110 @@
+\section{Introduction}\label{sec:intro}
+The attention module~\citep{bahdanau2014neural} is a critical building block in modern deep learning architectures~\citep{transformers, achiam2023gpt, behrouz2024titans, team2025gemma}, excelling due to its scalability and performance in in-context retrieval tasks. In principle, attention functions as an associative memory, computing direct pairwise token dependencies to store key-value mappings and retrieve them via query-key similarities. Computing this  pairwise dependencies, however, while accurate, causes quadratic space and time complexity, limiting their applicability in long context understanding, memorization, or modeling~\citep{liu2024lost, li2024survey, dalal2025one}.
+
+
+
+
+
+
+% Attention module~\citep{bahdanau2014neural} has been firmly established as the critical building block of state-of-the-art deep learning architectures~\citep{transformers, achiam2023gpt, behrouz2024titans, team2025gemma}, mainly due to their ability to learn at scale and their outstanding performance in in-context retrieval tasks. In principle, attentions function as an associative memory module, where they compute direct pairwise dependencies of tokens to learn how to store key-value mappings and how to retrieve them based on the pairwise similarity between queries (i.e., search signals) and keys (i.e., contexts). Computing this direct pairwise dependencies of tokens, however, causes quadratic space and time complexity, limiting their applicability to tasks that require long context understanding, memorizing, or modeling~\citep{liu2024lost, li2024survey, dalal2025one}.
+
+Recent research efforts aim to overcome the limitations of Transformers—i.e., pure attention-based architectures—in long-context modeling by designing more efficient yet effective recurrent neural networks~\citep{schlag2021linear, behrouz2024titans, peng2025rwkv7}. These modern recurrent architectures can be unified as associative memory modules optimizing an internal objective termed 'attentional bias'~\citep{behrouz2025Miras}. Unlike Transformers' growing KV cache, these models use fixed-size memory, necessitating improved memory management. Consequently, there's growing interest in enhancing RNN memory management through more effective: (i) Learning rules, from additive learning~\citep{katharopoulos2020transformers} to DeltaNet's Delta rule~\citep{schlag2021linear}; (ii) Forget (Retention) Gates, from RetNet's input-independent gating~\citep{sun2023retentive} to adaptive gating in Titans~\citep{behrouz2024titans} and RWKV-7~\citep{peng2025rwkv7}; and (iii) Memory Architectures, from vector-valued memory~\citep{sun2023retentive, peng2023rwkv} to neural deep memory modules~\citep{behrouz2024titans, sun2024learning}.
+
+
+
+Despite the success of these improved models in a diverse set of downstream benchmarks, they often struggle with long context understanding, in-context retrieval, and extrapolation to longer sequences~\citep{wen2024rnns, behrouz2024titans, arora2024simple, yang2024gated}. We observe these shortcomings arise from three design aspects: (1) The online nature of their memory update, where memory is optimized based on the current token while retaining past memory state, leading to memorization of individual tokens without considering broader context; (2) The limited capacity of memory, where architecture and key-value feature mappings restrict the number of perfectly mappable key-value pairs; and (3) The expressiveness of memory management (i.e., the internal objective's optimizer), as most recent models use gradient descent that relies on the first-order information about the dynamics of tokens, causing the memory to converge to spurious local minima and learn less effective key-value mappings.
+
+
+
+
+
+
+
+
+\begin{table*}
+    \centering
+    \caption{A summary of the recent modern recurrent neural networks. We compare these architectures based on five characteristics: (1) Dynamic decay; (2) Deep neural memory; (3) non-linear memory capacity; (4) Locally optimal: managing memory by (approximating) the second-order information about tokens; (5) Flexible context: the ability to flexibly memorize the \underline{context}. $\phi(\cdot)$ and $\phi^{*}(\cdot)$ represent polynomial and infinite-dimensional feature mappings (see \autoref{eq:infi-map}).}
+    \hspace*{-3ex}
+    \resizebox{1.05\linewidth}{!}{
+    \begin{tabular}{l l c c c c c c l}
+    \toprule
+         \multirow{2}{*}{Model} & \multirow{2}{*}{Attentional Bias  $\ell(\cdot; \cdot)$} & \multirow{2}{*}{Optimizer} & \multirow{1}{*}{Dynamic} & \multirow{1}{*}{Deep} & Non-linear & \multirow{1}{*}{Locally} & \multirow{1}{*}{Flexible}  & \multicolumn{1}{c}{\multirow{2}{*}{Memory Write Operation}} \\
+          &  &  & Decay & Memory & Capacity$^{\dagger}$ & Optimal & Context  &  \\
+         \midrule
+         \midrule
+         Attention & $\sum_{t = 1}^{L} a_t \| \M \vk_t - \vv_t \|^2_2$ & NP$^\ddagger$& \xmark & \xmark & \checkmark & \checkmark & \xmark & $\M_t = \M_{t-1} \cup \{(\vk_t, \vv_t)\}$\\
+         SWA  & $\sum_{t = c}^{L} a_t \| \M \vk_t - \vv_t \|^2_2$ & NP & \xmark & \xmark & \checkmark & \checkmark & \checkmark  & $\M_{t} = (\M_{t-1} \setminus \{(\vk_c, \vv_c)\}) \cup \{(\vk_t, \vv_t)\}$\\
+         \midrule
+         Linear Attention &  $\inner{\M_t \vk_t}{\vv_t}$ & GD & \xmark & \xmark & \xmark & \xmark & \xmark & \multicolumn{1}{l}{$\M_t =    \M_{t-1} +  {\vv_t  \vk_t^\top}$}\\
+         RetNet &  $\inner{\M_t \vk_t}{\vv_t}$ & GD & \xmark & \xmark & \xmark & \xmark & \xmark  & \multicolumn{1}{l}{$\M_t =   \alpha \M_{t-1} +  {\vv_t  \vk_t^\top}$}\\
+         GLA & $\inner{\M_t \vk_t}{\vv_t}$ & GD & \checkmark & \xmark  & \xmark & \xmark & \xmark  & $\M_t = \text{Diag}(\alpha_t )  \M_{t-1}   +  \vv_t\vk_t^\top$\\
+         PolySketchFor. & $\inner{\M_t \vk^p_t}{\vv_t}$ & GD & \xmark & \xmark  & \checkmark & \xmark & \xmark & $\M_t =  \M_{t-1}   +  \vv_t (\vk_t^\top)^p$\\
+         TTT      & $\| \M_t(\vk_t) - \vv_t \|^2_2$ & GD & \xmark & \checkmark & \xmark & \xmark & \xmark & $\M_t = \M_{t-1} -\eta \nabla \ell(\M_{t-1}; \vk_t, \vv_t)$\\
+         DeltaNet & $\| \M_t \vk_t - \vv_t \|^2_2$ & GD & \xmark & \xmark & \xmark & \xmark & \xmark & $\M_t =  (\mathbf{I} - \beta_t \vk_t \vk_t^\top) \M_{t-1} + \beta_t \vv_t  \vk_t^\top$\\
+         Longhorn & $\| \M_t \vk_t - \vv_t \|^2_2$ & Implicit GD & \xmark & \xmark & \xmark & \xmark & \xmark & $\M_t =  \left(\mathbf{I}- \delta_t \vk_t \vk^\top \right) \M_{t-1} + \left(\delta_t \odot \vv_t\right) \vk_t$ $^\S$\\
+         Gated DeltaNet & $\| \M_t \vk_t - \vv_t \|^2_2$ & GD & \checkmark & \xmark & \xmark & \xmark & \xmark & $\M_t =   \alpha_t (\mathbf{I} - \beta_t \vk_t \vk_t^\top) \M_{t-1} + \beta_t \vv_t  \vk_t^\top$\\
+        %  DeltaProduct & $\| \M_t \vk_t - \vv_t \|^2_2$ & MGD$^\S$ &  \checkmark & \xmark & \xmark & \xmark & \xmark & $\M_t =   \left(\alpha_t \prod_{i = 1}^{n} (\mathbf{I} - \beta_{t, i} \vk_{t, i} \vk_{t, i}^\top)\right) \M_{t-1} + \sum_{j = 1}^{n} \prod_{i = j}^{n} (\mathbf{I} - \beta_{t, i} \vv_{j, i} \vk_{j, i}^\top)$\\
+         RWKV-7 & $\| \M_t \vk_t - \vv_t \|^2_2$ & GD & \checkmark & \xmark & \xmark & \xmark & \xmark  & $\M_t =    (\text{diag}(\alpha_t) - \beta_t \vk_t \vk_t^\top) \M_{t-1}\! + \beta_t \vv_t  \vk_t^\top$\\
+         \vspace{-6pt}\\
+         \multirow{2}{*}{Titans} & \multirow{2}{*}{$\| \M_t(\vk_t) - \vv_t \|^2_2$} & \multirow{2}{*}{GD w/ M.$^*$} & \multirow{2}{*}{\checkmark} & \multirow{2}{*}{\checkmark} & \multirow{2}{*}{\xmark} & \multirow{2}{*}{\xmark} & \multirow{2}{*}{\xmark} & $\M_t = \alpha_t \M_{t-1} + \mathcal{S}_t$\\
+         & &  & & & & & & $\mathcal{S}_t = \eta_t \mathcal{S}_{t-1} - \theta_t \nabla \ell(\M_{t-1}; \vk_t, \vv_t)$\\
+         \vspace{-6pt}\\
+         Titans-- & $\| \M_t(\vk_t) - \vv_t \|^2_2$ & GD & \checkmark & \checkmark & \xmark & \xmark & \xmark & $\M_t = \alpha_t \M_{t-1} -\eta_t \nabla \ell(\M_{t-1}; \vk_t, \vv_t)$\\
+         \textsc{Moneta} & $\| \M_t(\vk_t) - \vv_t \|^p_p$ & GD & \checkmark & \checkmark & \checkmark & \xmark & \xmark & $\M_t = \alpha_t \M_{t-1} - \eta_t \nabla \ell(\M_{i-1};\vk_t, \vv_t)$ \\
+         \textsc{Memora} & $\| \M_t(\vk_t) - \vv_t \|^2_2$ & GD & \checkmark & \checkmark & \xmark & \xmark & \xmark  & $\M_t = \sigma\left( \alpha_t \log(\M_{t-1})  - \eta_t  \nabla \ell(\M_{t-1};\vk_t, \vv_t)\right)$\\
+         \midrule
+         \multicolumn{9}{c}{\textcolor{black}{\textbf{Our Models}}}\\
+         \midrule 
+         DLA & $\inner{\M_t(\phi(\vk_t))}{\vv_t}$ & GD & \checkmark & \checkmark & \xmark & \xmark & \xmark &  $\M_t = \alpha_t \M_{t-1} -\eta_t \nabla \ell(\M_{t-1}; \vk_t, \vv_t)$ \\
+         DeepTransformer$^\divideontimes$ & $\inner{\M_t(\phi^{*}(\vk_t))}{\vv_t}$ & GD & \checkmark & \checkmark & \checkmark & \xmark & \xmark &  $\M_t = \alpha_t \M_{t-1} -\eta_t \nabla \ell(\M_{t-1}; \vk_t, \vv_t)$ \\
+         SWDT & $\sum_{i = c}^{L} \inner{\M_t(\phi^{*}(\vk_i))}{\vv_i}$ & GD & \checkmark & \checkmark & \checkmark & \xmark & \checkmark & $\M_t = \alpha_t \M_{t-1} -\eta_t \nabla \ell(\M_{t-1}; \vk_t, \vv_t)$ \\
+         \learningrule Net & $\sum_{i = c}^{L} \gamma_i \left\| \M_t(\phi(\vk_i)) - \vv_i \right\|^2_2$ & GD & \checkmark & \checkmark & \checkmark & \xmark & \checkmark & $\M_t = \alpha_t \M_{t-1} -\eta_t \nabla \ell(\M_{t-1}; \vk_t, \vv_t)$\\ 
+         \textsc{Dot}$^\divideontimes$ & $\sum_{i = c}^{L} \gamma_i \left\| \M_t(\phi^{*}(\vk_i)) - \vv_i \right\|^2_2$ & GD & \checkmark & \checkmark & \checkmark & \xmark & \checkmark & $\M_t = \alpha_t \M_{t-1} -\eta_t \nabla \ell(\M_{t-1}; \vk_t, \vv_t)$\\ 
+          \vspace{-6pt}\\
+         \multirow{2}{*}{\model} & \multirow{2}{*}{$\sum_{i = c}^{L} \gamma_i \left\| \M_t(\phi(\vk_i)) - \vv_i \right\|^2_2$} & \multirow{2}{*}{Muon} & \multirow{2}{*}{\checkmark} & \multirow{2}{*}{\checkmark} & \multirow{2}{*}{\checkmark} & \multirow{2}{*}{\checkmark} & \multirow{2}{*}{\checkmark} & $\M_t = \alpha_t \M_{t-1} - \eta_t \:\: \texttt{NS-5}(\SSS_t)$ \\
+         & & & & & & & & $\SSS_t = \theta_t \SSS_{t-1} - \nabla \ell(\M_{t-1}; \vk_t, \vv_t)$ \\
+    \toprule 
+     \multicolumn{9}{l}{$^\dagger$ The matrix-valued memory version is considered. \qquad $^\ddagger$ NP: Nonparametric \qquad $^\S$ $\delta_t = \frac{\beta_t}{\mathbf{1}+ \beta_t \vk_t^\top \vk_t}$ . \qquad $^*$ Gradient Descent with Momentum. \qquad $^\divideontimes$ Without Normalization.}\\
+    \end{tabular}
+    }
+    \label{tab:my_label}
+\end{table*}
+
+
+
+
+
+
+
+
+\subsection*{Memory Perspective}
+Associative memory—the ability to map different entities or events—is an inseparable component of learning in humans~\citep{terry2017learning} and so has motivated several recent studies to understand the state-of-the-art deep learning architectures through its lens~\citep{ramsauer2021hopfield, behrouz2024titans, behrouz2025Miras, wang2025test}. In this perspective, memory is defined as a neural update caused by an input; the more surprising the input is, the more it affects the memory and so is memorable. Therefore, finding an effective ``surprise metric'' is a critical step towards designing such memory modules. As earlier discussed by \citet{behrouz2025Miras, behrouz2024titans}, almost all existing architectures use a surprise metric that updates the memory based on the current input. An event (as a sequence of tokens), however, might not consistently be surprising through a long-period of time although it is memorable. To overcome this issue, \citet{behrouz2024titans} suggest breaking the surprise metric into two parts of ``momentary'' and ``past'' surprise, incorporating the \emph{cumulative} surprise of past inputs when updating the memory with respect to the current input. This design, however, can miss the \emph{context} by memorizing individual tokens. To this end, in this work, we present a long-term neural memory module that measures the surprise of a local (or global) context window, meaning that it learns how to memorize the (\st{token}) context at test time. 
+
+
+Through the paper, we use the terminology ``Test Time Memorization'' because the process involves storing and retrieving information strictly within the global context, without updating the model's core learned parameters (i.e., outer-loop) or initial states from pre-training. Typically, no persistent learning or skill acquisition carries over to new, independent global context once the memory is cleared. Thus, we prefer the use of "test time memorization" over~using~"test~time~training".
+
+
+\subsection*{Contributions}
+In this paper, we aim to overcome the abovementioned limitations—i.e., (1) online nature, (2) limited memory capacity, and (3) less expressive memory management—by designing a long-term neural memory module with high capacity and the ability to memorize the context, instead of tokens. We further build upon these insights and present a family of strictly more powerful Transformers. More specifically:
+
+
+\head{Better Understanding of Memory Capacity and its Bottleneck}
+To improve the limited memory capacity, we suggest using higher-order feature mappings (e.g., polynomial feature kernels) on input tokens. We provide theoretical justifications on why deeper memory modules and/or higher-order feature mapping can enhance memory capacity—i.e., the maximum number of linearly independent key-value associations the memory can perfectly map.
+
+\head{New Expressive Learning Rule}
+To overcome the online nature of recent recurrent models, this work presents a sliding window update rule, called \learningrule{} rule, that optimizes and updates memory based on all past tokens in a given context window, not just the last. This allows the model to better manage its fixed-size memory and memorize a local context instead of individual tokens. 
+
+\head{Strict Generalization of Transformers} Next, we show how our \learningrule{} rule formulation connects to global and local softmax attentions (i.e., Sliding Window Attention - SWA) and present a new family of Transformer-like architectures, called \textsc{DeepTransformers} and its sliding window variants SWDT, that strictly generalize Transformers~\citep{transformers}. We further present a novel baseline of Deep Linear Attention (DLA) to demonstrate the role of deep memory.
+
+
+\head{New Memory Modules with Better Memory Management} 
+Building upon the above improvements, we present \omodel{}, a new architecture using polynomial features on its keys and queries, while updating its memory based on  \learningrule{} and gradient descent. To further enhance memory management, we introduce \model{}, which leverages the popular Muon optimizer~\citep{jordan2024muon} for updating the internal memory. We show that both \omodel~and \model{} can take advantage of parallelizable training algorithms, resulting in fast training without substantial overhead compared to the online version (i.e., context window = 1). To the best of our knowledge, \model{} is the first parallelizable recurrent architecture that optimizes the memory using the (approximation) of second-order information (i.e., has locally optimal memory module).
+
+
+\head{Improvement on Diverse Downstream Tasks} 
+Extensive experiments validate our model designs and proposed techniques, including ablations of modern architectures. We evaluated \textsc{DeepTransformer}s, \omodel{}, and \model{} on diverse benchmarks—language modeling, common-sense reasoning, recall-intensive, and needle-in-haystack tasks—where they outperformed modern linear RNNs, local attention (SWA), and Transformers. Furthermore, we studied the effects of memory architecture, feature mapping, memory management algorithm (internal optimizer), and  \learningrule{} rule on memory module capacity and performance in long-context understanding tasks.
+
+
+
+
+Proofs, additional experimental results, discussions on related work, and the details of experiments are in Appendix.

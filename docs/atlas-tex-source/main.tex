@@ -1,0 +1,281 @@
+\documentclass{article}
+
+\PassOptionsToPackage{table}{xcolor}
+\usepackage{etoolbox}       %
+\usepackage[utf8]{inputenc} % allow utf-8 input
+
+\usepackage{graphicx}  %
+
+\usepackage[parfill]{parskip}
+\usepackage{amsmath,amsthm}
+\usepackage{mathtools}  %
+\usepackage{adjustbox}
+\newcommand{\ols}[1]{\mskip.5\thinmuskip\overline{\mskip-.5\thinmuskip {#1} \mskip-.5\thinmuskip}\mskip.5\thinmuskip} % overline short
+\newcommand{\olsi}[1]{\,\overline{\!{#1}}} % overline short italic
+\newtoggle{arxiv}
+\toggletrue{arxiv}
+
+\newcommand{\vv}{\mathbf{v}}
+
+
+  \usepackage[parfill]{parskip}
+  \usepackage[citestyle=authoryear-comp,sorting=nyt,maxbibnames=99, maxcitenames=1, backend=biber, uniquename=false]{biblatex}
+  \newcommand{\citep}{\parencite}
+  \newcommand{\citeyearpar}{\citeyear}
+  \newcommand{\citet}{\textcite}
+  \addbibresource{main.bib}  %
+
+  \setlength{\textwidth}{6.8in}  %
+  \setlength{\textheight}{9in}
+  \setlength{\oddsidemargin}{0in}
+  \setlength{\evensidemargin}{0in}
+  \setlength{\topmargin}{-0.5in}
+  \newlength{\defbaselineskip}
+  \setlength{\defbaselineskip}{\baselineskip}
+  \setlength{\marginparwidth}{0.8in}
+  \setlength{\parskip}{6pt}%
+  \setlength{\parindent}{0pt}%
+
+  \RequirePackage[T1]{fontenc}
+  \RequirePackage[tt=false, type1=true]{libertine}
+  \RequirePackage[varqu]{zi4}
+  \RequirePackage[libertine]{newtxmath}
+
+
+\usepackage{bm}
+
+
+\usepackage[inline]{enumitem}
+\usepackage{booktabs}
+\usepackage{subcaption}
+\usepackage{multirow}
+\usepackage{wrapfig}
+\usepackage{algorithm,algorithmicx,algpseudocode}
+\usepackage{nicematrix}
+
+\usepackage[frozencache,cachedir=.]{minted} %
+
+
+
+\usepackage{import}
+\usepackage{lettrine}
+
+\newtheorem{theorem}{Theorem}  %
+\newtheorem{corollary}[theorem]{Corollary}  %
+
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{prop}{Proposition}
+\newtheorem{dfn}{Definition}
+\newtheorem{conjecture}{Conjecture}
+\newtheorem{remark}{Remark}
+
+\usepackage{pifont}%
+\newcommand{\cmark}{\ding{51}}%
+\newcommand{\xmark}{\ding{55}}%
+\usepackage[T1]{fontenc}
+
+\usepackage{thm-restate}
+
+
+\usepackage{url}            % simple URL typesetting
+\usepackage{booktabs}       % professional-quality tables
+\usepackage{amsfonts}       % blackboard math symbols
+\usepackage{nicefrac}       % compact symbols for 1/2, etc.
+\usepackage{microtype}      % microtypography
+
+\usepackage{wrapfig}
+
+
+\usepackage{caption}
+\usepackage{capt-of}
+\usepackage{lipsum}
+% \usepackage{fontspec, }
+
+\usepackage[colorlinks]{hyperref}
+\usepackage[capitalise,noabbrev]{cleveref}
+
+
+\usepackage{threeparttable}
+
+
+\definecolor{c1}{HTML}{586770}
+\definecolor{c4}{HTML}{2a4a67}
+\definecolor{c3}{HTML}{6d2a58}
+\definecolor{c2}{HTML}{34142a}
+\hypersetup{colorlinks=true, citecolor=c3, linkcolor=c2, urlcolor=c2}
+
+% \usepackage{thmtools}
+% \usepackage{thm-restate}
+
+
+\definecolor{myblue}{HTML}{FDF5E0} 
+\definecolor{mygray}{HTML}{DBE2E9} 
+\definecolor{mygreen}{HTML}{E6F3FC} 
+
+
+\definecolor{dark2orange}{rgb}{0.9, 0.4, 0.}
+\definecolor{dark2purple}{rgb}{0.4, 0.4, 0.8}
+
+
+
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=black,
+    urlcolor=c1,
+    citecolor=c1,
+}
+
+
+
+\usepackage{multirow}
+
+
+
+
+
+\renewcommand{\figureautorefname}{Figure}
+\renewcommand{\tableautorefname}{Table}
+\renewcommand{\sectionautorefname}{Section}
+\renewcommand{\subsectionautorefname}{Section}
+
+
+
+
+
+\renewcommand{\algorithmicrequire}{\textbf{Input:}}
+\renewcommand{\algorithmicensure}{\textbf{Output:}}
+
+\newcommand{\undermath}[2]{\underset{#1}{\underbrace{#2}}}
+
+
+\newcommand{\R}[0]{\mathbb{R}}
+\newcommand{\ttt}[0]{t}
+\newcommand{\inner}[2]{\langle #1, #2 \rangle}
+
+\newcommand{\M}[0]{\mathcal{M}}
+
+\newcommand{\head}[1]{\vspace{1.7mm}\noindent{{\textcolor{c4}{\bf #1.}}}}
+
+
+\newcommand{\model}[0]{\textsc{Atlas}}
+\newcommand{\omodel}[0]{\textsc{OmegaNet}}
+\newcommand{\learningrule}[0]{Omega}
+\newcommand{\modelss}[0]{?}
+\newcommand{\mb}[1]{\mathbf{#1}}
+
+\newcommand{\SSS}{\mathcal{S}}
+
+\usepackage{mathtools}
+\DeclarePairedDelimiter\ceil{\lceil}{\rceil}
+\DeclarePairedDelimiter\floor{\lfloor}{\rfloor}
+
+\usepackage{tikz}
+\newcommand*\circled[1]{\tikz[baseline=(char.base)]{
+            \node[shape=circle,draw,inner sep=0.3pt, fill=c2] (char) {\textcolor{white}{#1}};}}
+
+\newcommand\circledcolor[2]{\textcolor{#1}{\circled{#2}}}
+
+% \newcommand{\M}{\mathcal{M}}
+% \newcommand{\vk}{\mathbf{k}}
+% \newcommand{\vv}{\mathbf{v}}
+% \newcommand{\R}{\mathbb{R}}
+\newcommand{\cL}{\mathcal{L}}
+\newcommand{\e}{\mathbf{e}}
+\newcommand{\rank}{\operatorname{rank}}
+
+
+\usepackage{authblk}
+\usepackage{epigraph}
+\usepackage{soul}
+
+
+\newcommand{\vk}{\mathbf{k}}
+\newcommand{\vq}{\mathbf{q}}
+\renewcommand{\vv}{\mathbf{v}}
+% \NewDocumentCommand{\vv}{m}{\mathbf{#1}}
+\newcommand{\vu}{\mathbf{u}}
+\newcommand{\vx}{\mathbf{x}}
+
+\usepackage{tcolorbox}
+\usepackage{xcolor}
+\usepackage{lettrine,Zallman}
+\newtcolorbox{c4box}{boxrule=1pt, colback=c4!5!white,colframe=c4!50!white}
+\newtcolorbox{c3box}{boxrule=1pt, colback=c3!5!white,colframe=c3!50!white}
+\newtcolorbox{c2box}{boxrule=1pt, colback=c2!5!white,colframe=c2!50!white}
+\newtcolorbox{c1box}{boxrule=1pt, colback=c1!5!white,colframe=c1!50!white}
+
+\renewcommand{\LettrineFontHook}{\Zallmanfamily}
+
+
+\newcommand\bllfootnote[1]{%
+  \begingroup
+  \renewcommand\thefootnote{}\footnote{#1}%
+  \addtocounter{footnote}{1}%
+  \endgroup
+}
+
+\newcommand\blfootnote[1]{%
+  \begingroup
+  \renewcommand\thefootnote{}\footnote{#1}%
+  \addtocounter{footnote}{-1}%
+  \endgroup
+}
+
+
+
+\title{\model: Learning to Optimally Memorize the Context at Test Time} 
+
+
+
+
+\author{Ali Behrouz}
+\author{Zeman Li}
+\author{Praneeth Kacham}
+\author{Majid Daliri}
+\author{Yuan Deng}
+\author{Peilin Zhong}
+\author{\\Meisam Razaviyayn} 
+\author{Vahab Mirrokni \protect \blfootnote{\texttt{\{alibehrouz, zemanli, pkacham, dengyuan, peilinz, razaviyayn, mirrokni\}@google.com}, and majiddl.2099@gmail.com}}
+
+
+\affil{\protect\includegraphics[width=40mm]{Images/logo-research.png}} 
+\date{}
+
+
+
+\begin{document}
+
+\vspace{-20ex}
+\maketitle
+
+
+
+
+
+
+\begin{abstract}
+ Transformers have been established as the most popular backbones in sequence modeling, mainly due to their effectiveness in in-context retrieval tasks and the ability to learn at scale. Their quadratic memory and time complexity, however, bound their applicability in longer sequences and so has motivated researchers to explore effective alternative architectures such as modern recurrent neural networks (a.k.a long-term recurrent memory module). Despite their recent success in diverse downstream tasks, they struggle in tasks that requires long context understanding and extrapolation to longer sequences. We observe that these shortcomings come from three disjoint aspects in their design: (1) limited memory capacity that is bounded by the architecture of memory and feature mapping of the input; (2) online nature of update, i.e., optimizing the memory only with respect to the last input; and (3) less expressive management of their fixed-size memory. To enhance all these three aspects, we present \model, a long-term memory module with high capacity that learns to memorize the \emph{context} by optimizing the memory based on the current and past tokens, overcoming the online nature of long-term memory models. Building on this insight, we present a new family of Transformer-like architectures, called \textsc{DeepTransformers}, that are strict generalizations of the original Transformer architecture. Our experimental results on language modeling, common-sense reasoning, recall-intensive, and long-context understanding tasks show that \model{} surpasses the performance of Transformers and recent linear recurrent models. \model{} further improves the long context performance of Titans, achieving +80\% accuracy in 10M context length of BABILong benchmark. 
+%  We further evaluate the effect of our solutions on the memory capacity and memory management of recurrent models, providing insights on the potential reasons for their limited effective context length. 
+\end{abstract}
+
+
+\input{MainText/Intro}
+\input{MainText/Background}
+\input{MainText/Methods}
+\input{MainText/Experiments}
+\input{MainText/Conclusion}
+
+
+\newpage
+\printbibliography
+\newpage
+\appendix
+
+\input{Appendix/RelatedWork}
+\input{Appendix/Proofs}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\end{document}

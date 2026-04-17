@@ -1,0 +1,45 @@
+\section{Preliminaries}\label{sec:prelim}
+
+In this section, we first discuss the notation that we use through the paper and then review the background concepts and related work. 
+Additional discussion on related studies are in \autoref{app:rw}. 
+
+\head{Notations} We let $x \in \R^{N \times d_{\text{in}}}$ be the input, $\M_t$ be the state of memory $\M$ at time $t$, $\mathbf{K}$ be the keys, $\mathbf{V}$ be the values, and $\mathbf{Q}$ be the query matrices. We use bold lowercase letters with subscript $t$ to refer to vectors correspond to time $t$ (i.e., $\vk_t, \vv_t$, and $\vq_t$). Following  \citet{behrouz2025Miras}, we use $\ell(\M_t; \vk_t, \vv_t)$ to refer to the attentional bias (i.e., the internal memory objective). Through the paper, we use simple MLPs with $\mathcal{L}_{\M} \geq 1$ layers and residual connection as the architecture of the memory module $\M(\cdot)$. Notably, despite this choice, all of our model formulations are simply adaptable to other memory architecture choices; e.g., linear matrix-valued memory ($\mathcal{L}_{\M} = 1$). When it is needed, we parameterized the memory module with $\boldsymbol{\theta}_{\M} := \{W_1, \dots, W_{\mathcal{L}_{\M}}, \dots \}$, which at least includes the parameters of linear layers in the MLP. 
+
+
+\subsection{Backgrounds}
+
+\head{Attention}
+Attention is a critical component of Transformers that acts as their associative memory~\citep{bietti2023birth, sun2024learning, behrouz2025Miras}. Given input $x \in \R^{N \times d_{\text{in}}}$, causal attention computes output $\mathbf{y} \in \R^{N \times d_{\text{in}}}$ over input dependent key, value, and query matrices $\mathbf{Q} = x \mathbf{W}_{\mathbf{Q}}, \mathbf{K} = x \mathbf{W}_{\mathbf{K}}, \: \text{and}\:\: \mathbf{V} = x \mathbf{W}_{\mathbf{V}}$ as:
+\begin{align}\label{eq:attention}
+    &\mathbf{y}_i = \sum_{j = 1}^{i} \frac{ \exp\left( \mathbf{q}_i^{\top} \mathbf{k}_j/\sqrt{d_{\text{in}}}\right) \mathbf{v}_j }{\sum_{\ell = 1}^{i} \exp\left( \mathbf{q}_i^{\top} \mathbf{k}_{\ell}/\sqrt{d_{\text{in}}}\right)} =  \frac{1}{Z_i} \sum_{j = 1}^{i} \exp\left( \mathbf{q}_i^{\top} \mathbf{k}_j/\sqrt{d_{\text{in}}}\right) \mathbf{v}_j,
+\end{align}
+where $\mathbf{W}_{\mathbf{Q}}, \mathbf{W}_{\mathbf{K}},$ and $\mathbf{W}_{\mathbf{V}} \in \R^{d_{\text{in}} \times d_{\text{in}}}$ are learnable parameters, and $Z_i = {\sum_{\ell = 1}^{i} \exp\left( \mathbf{q}_i^{\top} \mathbf{k}_{\ell}/\sqrt{d_{\text{in}}}\right)}$ is the normalization term. Despite Transformers' simple parallelizable training and effectiveness in recall-intensive tasks~\citep{arora2024simple}, their generation process and long-context scaling are significant drawbacks, as attention requires at least
+$N\times d$ operations per token to calculate the output (see \autoref{eq:attention}). Therefore, in recent years, there have been an extensive research effort to design alternative architectures. We divide and review these studies into two groups: (1) Linear shallow memory recurrent models, (2) Deep memory modules:
+
+
+\head{(Linear) Recurrent Models}
+Linear RNNs have recently gained attention as efficient Transformer alternatives due to their parallelizable, linear-time training and comparable performance~\citep{sun2023retentive, peng2023rwkv}. Early modern RNN variants, often based on Hebbian~\citep{hebb2005organization} or Delta~\citep{widrow1988adaptive} learning rules, compress data into vector-valued or matrix-valued memory~\citep{katharopoulos2020transformers, sun2023retentive, polysketchformer-kacham2024, liu2024longhorn, schlag2021linear, lim2024parallelizing}.
+Let $\M_t \in \mathbb{R}^{d \times n}$ be the memory (where $n=1$ yields vector-valued memory), and $\vk, \vv \in \mathbb{R}^{d}$ be the keys and values (projections of input $x_t \in \mathbb{R}^{d}$)). A simple general formulation for such linear RNNs is:
+\begin{align}
+    \M_t = A_{t} \ast \M_{t-1} + \vv_t \vk_t^{\top}, 
+\end{align}
+where $\ast$ is an arbitrary associative operator and $A_t$
+  is a data-(in)dependent diagonal or low-rank plus identity matrix~\citep{yang2024parallelizing}. Despite the efficient \emph{linear} recurrent nature of these models, their memory can overflow, particularly with increasing context length. Although forget gates have recently significantly improved memory management in these architectures~\citep{sun2023retentive, peng2025rwkv7}, their memory's expressivity remains bounded by its linear structure.
+
+
+
+\head{Deep Memory Module}
+To overcome the limited expressivity of memory and to enhance the \emph{effective} context length recurrent models, recent studies focus on a new line of architectures with deep memory modules~\citep{irie2021going, sun2024learning, behrouz2024titans, behrouz2025Miras}. These architectures are built on the meta-learning perspective, where the memory is a deep MLP architecture updated by gradient descent (with momentum). Recently, \citet{behrouz2025Miras} present a framework to accurately unifies popular sequence models as the instances of test time memorization. That is, sequence models are associative memory modules that aim to learn the underlying mapping between given keys and values by optimizing an internal memory objective, called attentional bias. This optimization is based on an iterative optimization algorithms such as gradient descent. More formally, associative memory is defined as:
+\begin{dfn}[\citet{behrouz2025Miras}] \label{dfn:associative-memory}
+Given a set of keys $\mathcal{K} \subseteq \mathbb{R}^{d_k}$ and values $\mathcal{V} \subseteq \mathbb{R}^{d_v}$, associative memory is an mapping $\M: \mathcal{K} \rightarrow \mathcal{V}$. Learning the associative memory is based on an objective $\mathcal{L}$, called \emph{Attentional Bias}, that determines the type of memory and its priorities:
+\begin{align}\label{eq:attentional-bias-loss}
+    \M^* = \arg\min_{\M}\quad \mathcal{L}(\M(\mathcal{K}); \mathcal{V}).
+\end{align}
+\end{dfn}
+Optimizing this objective using an iterative algorithm (e.g., gradient descent) results in the memory update rule. Thus, the sequence model is a meta in-context learner with two  optimization levels:
+\begin{enumerate}
+    \item \textcolor{c4}{Inner Loop}: Where parameters of the memory module are optimized (i.e., $\boldsymbol{\theta}_{\M} = \{W_1, W_2, \dots, W_{\mathcal{L}_{\M}, \dots}\}$). In the inner optimization loop, all other parameters from the model are considered hyperparameters and are fixed and \emph{not} optimized.   
+    \item \textcolor{c4}{Outer Loop}: Where all other parameters of the model are optimized, such as linear projections, MLP layers, convolutions, etc. 
+\end{enumerate}
+Our terminology builds on this framework. Therefore, instead of full recurrent formulations, we describe models by their: (1) memory architecture, (2) internal objective (i.e., attentional bias), and (3) memory learning algorithm (optimizer). In most cases, models use matrix-valued memory with online gradient descent; for brevity in such instances, we refer to an architecture solely by its internal memory objective. For additional discussions and examples, see \autoref{app:miras}.
+

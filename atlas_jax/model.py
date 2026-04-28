@@ -67,6 +67,15 @@ def rms_norm(x, eps=1e-6):
     return (x * lax.rsqrt(ms + eps)).astype(dtype)
 
 
+def layer_norm(x, eps=1e-6):
+    """LayerNorm over the last axis (no learnable scale/bias), f32-stable."""
+    dtype = x.dtype
+    x = x.astype(jnp.float32)
+    mean = jnp.mean(x, axis=-1, keepdims=True)
+    var = jnp.mean((x - mean) ** 2, axis=-1, keepdims=True)
+    return ((x - mean) * lax.rsqrt(var + eps)).astype(dtype)
+
+
 def dropout(x, rate, key):
     keep = jax.random.bernoulli(key, 1.0 - rate, x.shape)
     return jnp.where(keep, x / (1.0 - rate), 0.0)
@@ -237,11 +246,11 @@ class AtlasMemoryLayer(eqx.Module):
     c_proj: eqx.nn.Linear
     conv_q: ShortConv | None
     conv_k: ShortConv | None
-    conv_v: ShortConv | None
     gate_alpha: eqx.nn.Linear
     gate_eta: eqx.nn.Linear
     gate_theta: eqx.nn.Linear
     gate_gamma: eqx.nn.Linear | None
+    gate_out: eqx.nn.Linear                # per-head output gate (Figure 3 l5 path)
     poly_coeffs: jax.Array
     W1_init: jax.Array
     W2_init: jax.Array
@@ -271,9 +280,8 @@ class AtlasMemoryLayer(eqx.Module):
         if config.conv_kernel > 0:
             self.conv_q = ShortConv(dim_inner, config.conv_kernel, key=keys[4])
             self.conv_k = ShortConv(dim_inner, config.conv_kernel, key=keys[5])
-            self.conv_v = ShortConv(dim_inner, config.conv_kernel, key=keys[6])
         else:
-            self.conv_q = self.conv_k = self.conv_v = None
+            self.conv_q = self.conv_k = None
 
         self.gate_alpha = eqx.nn.Linear(C, H, use_bias=True, key=keys[7])
         self.gate_eta = eqx.nn.Linear(C, H, use_bias=True, key=keys[8])
@@ -282,6 +290,7 @@ class AtlasMemoryLayer(eqx.Module):
             eqx.nn.Linear(C, H, use_bias=True, key=keys[10])
             if config.omega_window > 1 else None
         )
+        self.gate_out = eqx.nn.Linear(C, H, use_bias=True, key=keys[6])
 
         self.poly_coeffs = jnp.ones(POLY_DEGREE)
 
@@ -348,9 +357,13 @@ class AtlasMemoryLayer(eqx.Module):
         all_W1, W1 = linear_scan(W1, alpha, all_S_W1_orth)
         all_W2, W2 = linear_scan(W2, alpha, all_S_W2_orth)
 
-        # 8. Retrieve with per-timestep weights:  y_t = q_t + W1_t @ GELU(W2_t @ q_t).
+        # 8. Retrieve with per-timestep weights:  y_t = q_t + LN(W1_t @ GELU(W2_t @ q_t)).
+        # Paper Appendix A.2 specifies "residual connections and layer norm at the end of
+        # each chunk"; following the TTT/lucidrains convention, LN is applied to the
+        # MLP output BEFORE the residual add (so the residual path is preserved).
         h_q = jnp.einsum('bched,bchd->bche', all_W2, q_c)
-        y_c = q_c + jnp.einsum('bchde,bche->bchd', all_W1, jax.nn.gelu(h_q))
+        mem_out = jnp.einsum('bchde,bche->bchd', all_W1, jax.nn.gelu(h_q))
+        y_c = q_c + layer_norm(mem_out)
 
         return y_c, MemoryState(W1=W1, W2=W2, S_W1=S_W1, S_W2=S_W2)
 
@@ -360,12 +373,13 @@ class AtlasMemoryLayer(eqx.Module):
         H, D, E = self.n_head, self.head_dim, self.expand_dim
         cs = self.chunk_size
 
-        # QKV + optional ShortConv + RMS norm + polynomial features.
+        # QKV + optional ShortConv (on Q/K only; V is pure linear per Figure 3)
+        # + RMS norm + polynomial features.
         q = (x @ self.c_q.weight.T)
         k = (x @ self.c_k.weight.T)
         v = (x @ self.c_v.weight.T)
         if self.conv_q is not None:
-            q = self.conv_q(q); k = self.conv_k(k); v = self.conv_v(v)
+            q = self.conv_q(q); k = self.conv_k(k)
         q = q.reshape(B, T, H, D); k = k.reshape(B, T, H, D); v = v.reshape(B, T, H, D)
 
         q = self._poly(rms_norm(q))
@@ -420,6 +434,12 @@ class AtlasMemoryLayer(eqx.Module):
         # (n_chunks, B, cs, H, D) -> (B, T, H, D)
         y = jnp.transpose(all_y, (1, 0, 2, 3, 4)).reshape(B, T, H, D)
         y = y[:, :T_orig]
+
+        # Output gate (Figure 3 l5 path): per-head sigmoid from input x,
+        # multiplied into the retrieval output.
+        gate_logits = x @ self.gate_out.weight.T + self.gate_out.bias   # (B, T, H)
+        gate = jax.nn.sigmoid(gate_logits)[..., jnp.newaxis]             # (B, T, H, 1)
+        y = y * gate
 
         # Output projection.
         y = (y.reshape(B, T_orig, H * D) @ self.c_proj.weight.T)

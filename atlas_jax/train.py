@@ -177,8 +177,10 @@ def main():
             bpb = loss_val / bpb_div
             tps = tokens_per_step / dt
             elapsed = time.time() - t_start
+            stats = jax.devices()[0].memory_stats() if jax.devices()[0].platform == 'gpu' else None
+            mem_str = f' | mem {stats["peak_bytes_in_use"] / (1024 ** 2):.0f}MB' if stats else ''
             print(f'step {step:5d} | loss {loss_val:.4f} | bpb {bpb:.4f} | '
-                  f'{dt * 1000:.0f}ms | {tps:.0f} tok/s | {elapsed:.0f}s')
+                  f'{dt * 1000:.0f}ms | {tps:.0f} tok/s | {elapsed:.0f}s{mem_str}')
 
         if args.eval_every > 0 and step % args.eval_every == 0:
             val_losses = []

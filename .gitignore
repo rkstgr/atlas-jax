@@ -5,3 +5,16 @@ __pycache__/
 *.log
 out/
 .pytest_cache/
+
+# Local agent state
+.claude/
+
+# Datasets (download separately)
+data/
+
+# Core dumps
+core.*
+
+# JURECA-specific scripts (kept locally; backed up separately)
+scripts/
+*.slurm
